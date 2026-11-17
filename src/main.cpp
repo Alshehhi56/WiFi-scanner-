@@ -40,8 +40,11 @@
 #include <algorithm>
 #include <math.h>
 #include <stdarg.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <esp_system.h>
 
-#define FW_VERSION "2.0.0"
+#define FW_VERSION "2.1.0"
 
 static const int MAX_CH = 13;    // channels 1..13 allowed in the UAE
 static const int MAX_APS = 80;   // BSSIDs kept per cycle
@@ -69,6 +72,8 @@ struct Settings {
   uint16_t intervalS = 60;
   bool raw = true;
   bool json = false;
+  String staSsid, staPass;  // your Wi-Fi (stored in flash only)
+  String adminPass;         // web login + hotspot password
 } cfg;
 
 Preferences prefs;
@@ -102,6 +107,9 @@ static void loadSettings() {
   cfg.intervalS = prefs.getUShort("interval", 60);
   cfg.raw = prefs.getBool("raw", true);
   cfg.json = prefs.getBool("json", false);
+  cfg.staSsid = prefs.getString("stassid", "");
+  cfg.staPass = prefs.getString("stapass", "");
+  cfg.adminPass = prefs.getString("admin", "");
   if (cfg.rounds < 1 || cfg.rounds > 10) cfg.rounds = 4;
   if (cfg.intervalS < 10 || cfg.intervalS > 3600) cfg.intervalS = 60;
   parseHomeList();
@@ -113,6 +121,9 @@ static void saveSettings() {
   prefs.putUShort("interval", cfg.intervalS);
   prefs.putBool("raw", cfg.raw);
   prefs.putBool("json", cfg.json);
+  prefs.putString("stassid", cfg.staSsid);
+  prefs.putString("stapass", cfg.staPass);
+  prefs.putString("admin", cfg.adminPass);
 }
 
 // ------------------------------------------------------------ status LED
@@ -692,32 +703,34 @@ static String jsonEsc(const String &s) {
   return o;
 }
 
-static void printReport() {
-  Serial.println();
-  Serial.println("==================================================");
-  Serial.printf(" NETWORK DIAGNOSTIC v%s   cycle %u\n", FW_VERSION, cycleNo);
-  Serial.printf(" %d scans | %d BSSIDs | %d radios | uptime %lus\n", roundsDone, (int)aps.size(),
+static void writeJson(Print &out);
+
+static void printReport(Print &out) {
+  out.println();
+  out.println("==================================================");
+  out.printf(" NETWORK DIAGNOSTIC v%s   cycle %u\n", FW_VERSION, cycleNo);
+  out.printf(" %d scans | %d BSSIDs | %d radios | uptime %lus\n", roundsDone, (int)aps.size(),
                 (int)radios.size(), millis() / 1000);
-  Serial.printf(" Your networks: %s\n", cfg.home.length() ? cfg.home.c_str() : "(not set)");
-  Serial.println("==================================================");
+  out.printf(" Your networks: %s\n", cfg.home.length() ? cfg.home.c_str() : "(not set)");
+  out.println("==================================================");
 
   if (cfg.raw) {
-    Serial.println("\n-- ACCESS POINTS (avg dBm, spread, seen) --");
-    Serial.println("CH  W   RSSI  SD SEEN SEC      PHY  SSID");
+    out.println("\n-- ACCESS POINTS (avg dBm, spread, seen) --");
+    out.println("CH  W   RSSI  SD SEEN SEC      PHY  SSID");
     std::vector<int> order(aps.size());
     for (size_t i = 0; i < aps.size(); i++) order[i] = i;
     std::sort(order.begin(), order.end(), [](int x, int y) { return aps[x].avg() > aps[y].avg(); });
     for (int i : order) {
       ApObs &a = aps[i];
-      Serial.printf("%2d %s %5.0f %3.0f  %d/%d %-8s %-4s %s%s %s\n", a.ch,
+      out.printf("%2d %s %5.0f %3.0f  %d/%d %-8s %-4s %s%s %s\n", a.ch,
                     a.second ? "40" : "20", a.avg(), a.sd(), a.seen, roundsDone, authName(a.auth),
                     phyName(a), isHome(a.ssid) ? "*" : "", a.hidden() ? "<hidden>" : a.ssid.c_str(),
                     macStr(a.bssid).substring(9).c_str());
     }
-    Serial.println("(* = your network, last 3 MAC bytes shown)");
+    out.println("(* = your network, last 3 MAC bytes shown)");
   }
 
-  Serial.println("\n-- CHANNEL INTERFERENCE ESTIMATE (all radios) --");
+  out.println("\n-- CHANNEL INTERFERENCE ESTIMATE (all radios) --");
   float loads[MAX_CH + 1];
   float mx = 0.01f;
   for (int c = 1; c <= MAX_CH; c++) {
@@ -728,41 +741,36 @@ static void printReport() {
     int prim = 0;
     for (auto &R : radios)
       if (R.ch == c) prim++;
-    Serial.printf("%s%2d %s %5.2f  %d AP\n", isStd(c) ? ">" : " ", c, bar(loads[c], mx, 20).c_str(),
+    out.printf("%s%2d %s %5.2f  %d AP\n", isStd(c) ? ">" : " ", c, bar(loads[c], mx, 20).c_str(),
                   loads[c], prim);
   }
   int order3[3] = {1, 6, 11};
   std::sort(order3, order3 + 3, [&](int a, int b) { return loads[a] < loads[b]; });
-  Serial.printf("Least busy of 1/6/11: %d, then %d, then %d\n", order3[0], order3[1], order3[2]);
-  Serial.println("(score = overlap x signal; estimate, not airtime)");
+  out.printf("Least busy of 1/6/11: %d, then %d, then %d\n", order3[0], order3[1], order3[2]);
+  out.println("(score = overlap x signal; estimate, not airtime)");
 
-  Serial.println("\n-- FINDINGS --");
+  out.println("\n-- FINDINGS --");
   int nC = 0, nW = 0, nI = 0;
   for (auto &f : findings) {
     if (f.sev == SEV_CRIT) nC++;
     else if (f.sev == SEV_WARN) nW++;
     else if (f.sev == SEV_INFO) nI++;
-    Serial.printf("\n[%s][%s][%s] %s\n", SEV_NAME[f.sev], CONF_NAME[f.conf], persistLabel(f.id).c_str(),
+    out.printf("\n[%s][%s][%s] %s\n", SEV_NAME[f.sev], CONF_NAME[f.conf], persistLabel(f.id).c_str(),
                   f.test.c_str());
-    Serial.printf("  Finding : %s\n", f.finding.c_str());
-    if (f.evidence.length()) Serial.printf("  Evidence: %s\n", f.evidence.c_str());
-    Serial.printf("  Action  : %s\n", f.action.c_str());
+    out.printf("  Finding : %s\n", f.finding.c_str());
+    if (f.evidence.length()) out.printf("  Evidence: %s\n", f.evidence.c_str());
+    out.printf("  Action  : %s\n", f.action.c_str());
   }
-  Serial.printf("\nSUMMARY: %d critical, %d warnings, %d info\n", nC, nW, nI);
-  Serial.println("Note: scan data shows beacons only; it cannot measure real airtime");
-  Serial.println("or non-Wi-Fi interference. CONFIRMED = read from beacons,");
-  Serial.println("LIKELY = strong inference, POSSIBLE = needs more evidence.");
-  Serial.printf("Next cycle in %us. Type 'help' for commands.\n", cfg.intervalS);
+  out.printf("\nSUMMARY: %d critical, %d warnings, %d info\n", nC, nW, nI);
+  out.println("Note: scan data shows beacons only; it cannot measure real airtime");
+  out.println("or non-Wi-Fi interference. CONFIRMED = read from beacons,");
+  out.println("LIKELY = strong inference, POSSIBLE = needs more evidence.");
+  out.printf("Next cycle in %us. Type 'help' for commands.\n", cfg.intervalS);
 
   if (cfg.json) {
-    Serial.printf("JSON:{\"fw\":\"%s\",\"cycle\":%u,\"scans\":%d,\"findings\":[", FW_VERSION, cycleNo, roundsDone);
-    for (size_t i = 0; i < findings.size(); i++) {
-      Finding &f = findings[i];
-      Serial.printf("%s{\"id\":\"%s\",\"sev\":\"%s\",\"conf\":\"%s\",\"test\":\"%s\",\"finding\":\"%s\",\"action\":\"%s\"}",
-                    i ? "," : "", jsonEsc(f.id).c_str(), SEV_NAME[f.sev], CONF_NAME[f.conf],
-                    jsonEsc(f.test).c_str(), jsonEsc(f.finding).c_str(), jsonEsc(f.action).c_str());
-    }
-    Serial.println("]}");
+    out.print("JSON:");
+    writeJson(out);
+    out.println();
   }
 
   // LED: red = critical, yellow = warning, green = fine
@@ -771,7 +779,208 @@ static void printReport() {
   else led(0, 20, 0);
 }
 
-// ------------------------------------------------------------ commands
+
+static void writeJson(Print &out) {
+  out.printf("{\"fw\":\"%s\",\"cycle\":%u,\"scans\":%d,\"findings\":[", FW_VERSION, cycleNo, roundsDone);
+  for (size_t i = 0; i < findings.size(); i++) {
+    Finding &f = findings[i];
+    out.printf("%s{\"id\":\"%s\",\"sev\":\"%s\",\"conf\":\"%s\",\"test\":\"%s\",\"finding\":\"%s\",\"evidence\":\"%s\",\"action\":\"%s\"}",
+               i ? "," : "", jsonEsc(f.id).c_str(), SEV_NAME[f.sev], CONF_NAME[f.conf], jsonEsc(f.test).c_str(),
+               jsonEsc(f.finding).c_str(), jsonEsc(f.evidence).c_str(), jsonEsc(f.action).c_str());
+  }
+  out.print("]}");
+}
+
+// ------------------------------------------------------------ report buffer
+class StrPrint : public Print {
+ public:
+  String s;
+  size_t write(uint8_t c) override { s += (char)c; return 1; }
+  size_t write(const uint8_t *b, size_t n) override {
+    for (size_t i = 0; i < n; i++) s += (char)b[i];
+    return n;
+  }
+};
+String lastReport = "No report yet - first scan is running.";
+
+// ------------------------------------------------------------ Wi-Fi access
+WebServer server(80);
+String apName;
+bool staWasConnected = false;
+unsigned long staRetryAt = 0;
+
+static String randomPass() {
+  const char *chars = "abcdefghjkmnpqrstuvwxyz23456789";
+  String p;
+  for (int i = 0; i < 10; i++) p += chars[esp_random() % 31];
+  return p;
+}
+
+static void startStation() {
+  if (!cfg.staSsid.length()) return;
+  Serial.printf("> joining Wi-Fi '%s' ...\n", cfg.staSsid.c_str());
+  WiFi.begin(cfg.staSsid.c_str(), cfg.staPass.c_str());
+}
+
+static void printAccess() {
+  Serial.println("\n-- WI-FI ACCESS --");
+  Serial.printf("Hotspot : %s   password: %s\n", apName.c_str(), cfg.adminPass.c_str());
+  Serial.printf("Open    : http://%s   (login: admin / same password)\n", WiFi.softAPIP().toString().c_str());
+  if (WiFi.status() == WL_CONNECTED)
+    Serial.printf("Home LAN: http://%s  or  http://netdiag.local  (via %s)\n",
+                  WiFi.localIP().toString().c_str(), cfg.staSsid.c_str());
+  else if (cfg.staSsid.length())
+    Serial.printf("Home LAN: not connected to '%s' yet\n", cfg.staSsid.c_str());
+  else
+    Serial.println("Home LAN: not set (use the web page or: wifi SSID|PASSWORD)");
+}
+
+// ------------------------------------------------------------ web pages
+static String htmlEsc(const String &s) {
+  String o;
+  o.reserve(s.length() + 64);
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '<') o += "&lt;";
+    else if (c == '>') o += "&gt;";
+    else if (c == '&') o += "&amp;";
+    else if (c == '"') o += "&quot;";
+    else o += c;
+  }
+  return o;
+}
+
+static bool auth() {
+  if (server.authenticate("admin", cfg.adminPass.c_str())) return true;
+  server.requestAuthentication(BASIC_AUTH, "NetDiag");
+  return false;
+}
+
+bool scanRequested = true;  // run first cycle at boot
+bool cycleActive = false;
+int cycleRound = 0;
+
+static void sendRedirect(const String &msg) {
+  server.sendHeader("Location", "/?m=" + msg);
+  server.send(303);
+}
+
+static void handleRoot() {
+  if (!auth()) return;
+  String msg = server.arg("m");
+  String h;
+  h.reserve(lastReport.length() + 3500);
+  h += F("<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+         "<title>NetDiag</title><style>body{font-family:sans-serif;margin:8px;background:#f4f4f4}"
+         "pre{background:#111;color:#ddd;padding:8px;font-size:11px;overflow-x:auto;white-space:pre}"
+         "fieldset{background:#fff;border:1px solid #ccc;border-radius:6px;margin:8px 0}"
+         "input{width:95%;padding:6px;margin:3px 0}button{padding:10px 14px;margin:4px 0}"
+         ".m{background:#dfd;padding:6px;border-radius:4px}</style></head><body>");
+  h += "<h3>NetDiag v" FW_VERSION "</h3>";
+  if (msg.length()) h += "<p class='m'>" + htmlEsc(msg) + "</p>";
+  h += fmt("<p>Cycle %u %s | ", cycleNo, cycleActive ? "<b>(scanning...)</b>" : "");
+  if (WiFi.status() == WL_CONNECTED)
+    h += "Home LAN: " + htmlEsc(cfg.staSsid) + " " + WiFi.localIP().toString() + fmt(" (%d dBm)", WiFi.RSSI());
+  else
+    h += "Home LAN: not connected";
+  h += "</p><form method='post' action='/scan'><button>Scan now</button> <a href='/'>Refresh</a> | <a href='/api/report'>JSON</a></form>";
+  h += "<pre>" + htmlEsc(lastReport) + "</pre>";
+
+  h += "<form method='post' action='/settings'><fieldset><legend>Diagnostics</legend>"
+       "Your networks (comma separated)<input name='home' value='" + htmlEsc(cfg.home) + "'>"
+       "Scans per cycle (1-10)<input name='rounds' type='number' value='" + String(cfg.rounds) + "'>"
+       "Seconds between cycles (10-3600)<input name='interval' type='number' value='" + String(cfg.intervalS) + "'>"
+       "<button>Save</button></fieldset></form>";
+
+  h += "<form method='post' action='/wifi'><fieldset><legend>Join my Wi-Fi (2.4 GHz)</legend>"
+       "SSID<input name='ssid' value='" + htmlEsc(cfg.staSsid) + "'>"
+       "Password<input name='pass' type='password' placeholder='(unchanged if empty)'>"
+       "<button>Connect</button> <button name='forget' value='1'>Forget</button></fieldset></form>";
+
+  h += "<form method='post' action='/password'><fieldset><legend>Admin / hotspot password</legend>"
+       "New password (8+ chars)<input name='p1' type='password'>Repeat<input name='p2' type='password'>"
+       "<button>Change</button></fieldset></form>";
+  h += "<form method='post' action='/reset'><button>Clear history</button></form></body></html>";
+  server.send(200, "text/html", h);
+}
+
+static void handleScan() {
+  if (!auth()) return;
+  scanRequested = true;
+  sendRedirect("Scan started - refresh in about 20 seconds");
+}
+
+static void handleSettings() {
+  if (!auth()) return;
+  cfg.home = server.arg("home");
+  cfg.home.trim();
+  int r = server.arg("rounds").toInt(), iv = server.arg("interval").toInt();
+  if (r >= 1 && r <= 10) cfg.rounds = r;
+  if (iv >= 10 && iv <= 3600) cfg.intervalS = iv;
+  parseHomeList();
+  history.clear();
+  saveSettings();
+  sendRedirect("Saved");
+}
+
+static void handleWifi() {
+  if (!auth()) return;
+  if (server.arg("forget") == "1") {
+    cfg.staSsid = ""; cfg.staPass = "";
+    saveSettings();
+    WiFi.disconnect(false, true);
+    sendRedirect("Home Wi-Fi forgotten");
+    return;
+  }
+  String ss = server.arg("ssid"), pw = server.arg("pass");
+  ss.trim();
+  if (!ss.length()) { sendRedirect("SSID is empty"); return; }
+  if (ss != cfg.staSsid || pw.length()) cfg.staPass = pw;
+  cfg.staSsid = ss;
+  saveSettings();
+  sendRedirect("Connecting to " + ss + " - check the status line in 15 s");
+  delay(200);
+  WiFi.disconnect();
+  startStation();
+}
+
+static void handlePassword() {
+  if (!auth()) return;
+  String a = server.arg("p1"), b = server.arg("p2");
+  if (a.length() < 8 || a.length() > 63 || a != b) { sendRedirect("Passwords must match and be 8-63 characters"); return; }
+  cfg.adminPass = a;
+  saveSettings();
+  sendRedirect("Password changed. Hotspot restarts - reconnect with the new password");
+  delay(300);
+  WiFi.softAP(apName.c_str(), cfg.adminPass.c_str());
+}
+
+static void handleReset() {
+  if (!auth()) return;
+  history.clear(); lastChannel.clear(); cycleNo = 0;
+  sendRedirect("History cleared");
+}
+
+static void handleJson() {
+  if (!auth()) return;
+  StrPrint p;
+  writeJson(p);
+  server.send(200, "application/json", p.s);
+}
+
+static void startWeb() {
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/scan", HTTP_POST, handleScan);
+  server.on("/settings", HTTP_POST, handleSettings);
+  server.on("/wifi", HTTP_POST, handleWifi);
+  server.on("/password", HTTP_POST, handlePassword);
+  server.on("/reset", HTTP_POST, handleReset);
+  server.on("/api/report", HTTP_GET, handleJson);
+  server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
+  server.begin();
+}
+
+// ------------------------------------------------------------ serial commands
 static void printHelp() {
   Serial.println("\nCommands:");
   Serial.println("  scan               run a diagnostic cycle now");
@@ -781,6 +990,9 @@ static void printHelp() {
   Serial.println("  interval S         seconds between cycles (10-3600)");
   Serial.println("  raw on|off         access point table");
   Serial.println("  json on|off        machine-readable report");
+  Serial.println("  wifi               show hotspot / web access details");
+  Serial.println("  wifi SSID|PASSWORD join your Wi-Fi (note the | between)");
+  Serial.println("  wifi -             forget your Wi-Fi");
   Serial.println("  reset              clear persistence history");
   Serial.println("  status             show settings");
 }
@@ -791,7 +1003,6 @@ static void printStatus() {
                 cfg.raw ? "on" : "off", cfg.json ? "on" : "off", cycleNo);
 }
 
-bool scanRequested = true;  // run first cycle at boot
 String lineBuf;
 
 static void handleCommand(String line) {
@@ -823,6 +1034,19 @@ static void handleCommand(String line) {
   } else if (cmd == "raw") { cfg.raw = (arg == "on"); saveSettings(); Serial.printf("> raw %s\n", cfg.raw ? "on" : "off"); }
   else if (cmd == "json") { cfg.json = (arg == "on"); saveSettings(); Serial.printf("> json %s\n", cfg.json ? "on" : "off"); }
   else if (cmd == "reset") { history.clear(); lastChannel.clear(); cycleNo = 0; Serial.println("> history cleared"); }
+  else if (cmd == "wifi") {
+    if (!arg.length()) printAccess();
+    else if (arg == "-") { cfg.staSsid = ""; cfg.staPass = ""; saveSettings(); WiFi.disconnect(false, true); Serial.println("> Wi-Fi forgotten"); }
+    else {
+      int bar = arg.indexOf('|');
+      if (bar < 1) { Serial.println("> use: wifi SSID|PASSWORD"); return; }
+      cfg.staSsid = arg.substring(0, bar);
+      cfg.staPass = arg.substring(bar + 1);
+      saveSettings();
+      WiFi.disconnect();
+      startStation();
+    }
+  }
   else Serial.println("> unknown command, type 'help'");
 }
 
@@ -832,26 +1056,36 @@ static void pollSerial() {
     if (c == '\n' || c == '\r') {
       if (lineBuf.length()) handleCommand(lineBuf);
       lineBuf = "";
-    } else if (lineBuf.length() < 120) {
+    } else if (lineBuf.length() < 160) {
       lineBuf += c;
     }
   }
 }
 
 // ------------------------------------------------------------ main
-static void runCycle() {
-  cycleNo++;
-  aps.clear();
-  roundsDone = 0;
-  led(0, 0, 20);  // blue while scanning
-  Serial.printf("\n> cycle %u: %u scans of channels 1-%d ...\n", cycleNo, cfg.rounds, MAX_CH);
-  for (int i = 0; i < cfg.rounds; i++) {
-    scanRound();
-    Serial.printf("  scan %d/%u: %d BSSIDs so far\n", i + 1, cfg.rounds, (int)aps.size());
-    pollSerial();
+// One scan per loop() pass so the web page stays responsive between scans.
+static void stepCycle() {
+  if (!cycleActive) {
+    cycleNo++;
+    aps.clear();
+    roundsDone = 0;
+    cycleRound = 0;
+    cycleActive = true;
+    led(0, 0, 20);  // blue while scanning
+    Serial.printf("\n> cycle %u: %u scans of channels 1-%d ...\n", cycleNo, cfg.rounds, MAX_CH);
+    return;
   }
-  analyse();
-  printReport();
+  if (scanRound()) cycleRound++;
+  else { static int fails = 0; if (++fails % 3 == 0) cycleRound++; }  // don't get stuck
+  Serial.printf("  scan %d/%u: %d BSSIDs so far\n", cycleRound, cfg.rounds, (int)aps.size());
+  if (cycleRound >= cfg.rounds) {
+    analyse();
+    StrPrint rp;
+    printReport(rp);
+    lastReport = rp.s;
+    Serial.print(lastReport);
+    cycleActive = false;
+  }
 }
 
 unsigned long lastCycle = 0;
@@ -861,10 +1095,13 @@ void setup() {
   delay(800);
   Serial.printf("\nESP32-S3 Network Diagnostic Tool v%s\n", FW_VERSION);
   loadSettings();
+  if (cfg.adminPass.length() < 8) {  // first boot: make a unique password
+    cfg.adminPass = randomPass();
+    saveSettings();
+  }
 
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  delay(100);
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setAutoReconnect(true);
 
   // UAE regulatory domain: channels 1-13
   wifi_country_t country;
@@ -876,16 +1113,36 @@ void setup() {
   country.policy = WIFI_COUNTRY_POLICY_MANUAL;
   if (esp_wifi_set_country(&country) != ESP_OK) Serial.println("! could not set country (using default)");
 
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  apName = fmt("NetDiag-%02X%02X", mac[4], mac[5]);
+  WiFi.softAP(apName.c_str(), cfg.adminPass.c_str());
+  startStation();
+  startWeb();
+  if (MDNS.begin("netdiag")) MDNS.addService("http", "tcp", 80);
+
   printStatus();
-  if (homeList.empty()) Serial.println("Tip: type  home YourSSID  so the advice targets your network.");
+  printAccess();
+  if (homeList.empty()) Serial.println("Tip: set your networks on the web page or type: home YourSSID");
 }
 
 void loop() {
+  server.handleClient();
   pollSerial();
-  if (scanRequested || millis() - lastCycle >= (unsigned long)cfg.intervalS * 1000UL) {
+
+  bool up = WiFi.status() == WL_CONNECTED;
+  if (up != staWasConnected) {
+    staWasConnected = up;
+    if (up) printAccess();
+    else Serial.println("> home Wi-Fi disconnected");
+  }
+
+  if (cycleActive) {
+    stepCycle();
+  } else if (scanRequested || millis() - lastCycle >= (unsigned long)cfg.intervalS * 1000UL) {
     scanRequested = false;
-    runCycle();
+    stepCycle();
     lastCycle = millis();
   }
-  delay(20);
+  delay(5);
 }
