@@ -45,7 +45,8 @@
 #include <esp_system.h>
 #include <esp_mac.h>
 
-#define FW_VERSION "2.1.1"
+#define FW_VERSION "2.1.2"
+#define DEFAULT_PASS "netdiag123"  // public default; change it with: pass NEWPASSWORD
 
 static const int MAX_CH = 13;    // channels 1..13 allowed in the UAE
 static const int MAX_APS = 80;   // BSSIDs kept per cycle
@@ -75,6 +76,7 @@ struct Settings {
   bool json = false;
   String staSsid, staPass;  // your Wi-Fi (stored in flash only)
   String adminPass;         // web login + hotspot password
+  bool customPass = false;  // true once you set your own password
 } cfg;
 
 Preferences prefs;
@@ -111,6 +113,7 @@ static void loadSettings() {
   cfg.staSsid = prefs.getString("stassid", "");
   cfg.staPass = prefs.getString("stapass", "");
   cfg.adminPass = prefs.getString("admin", "");
+  cfg.customPass = prefs.getBool("custompw", false);
   if (cfg.rounds < 1 || cfg.rounds > 10) cfg.rounds = 4;
   if (cfg.intervalS < 10 || cfg.intervalS > 3600) cfg.intervalS = 60;
   parseHomeList();
@@ -125,6 +128,7 @@ static void saveSettings() {
   prefs.putString("stassid", cfg.staSsid);
   prefs.putString("stapass", cfg.staPass);
   prefs.putString("admin", cfg.adminPass);
+  prefs.putBool("custompw", cfg.customPass);
 }
 
 // ------------------------------------------------------------ status LED
@@ -810,12 +814,6 @@ String apName;
 bool staWasConnected = false;
 unsigned long staRetryAt = 0;
 
-static String randomPass() {
-  const char *chars = "abcdefghjkmnpqrstuvwxyz23456789";
-  String p;
-  for (int i = 0; i < 10; i++) p += chars[esp_random() % 31];
-  return p;
-}
 
 static void startStation() {
   if (!cfg.staSsid.length()) return;
@@ -950,6 +948,7 @@ static void handlePassword() {
   String a = server.arg("p1"), b = server.arg("p2");
   if (a.length() < 8 || a.length() > 63 || a != b) { sendRedirect("Passwords must match and be 8-63 characters"); return; }
   cfg.adminPass = a;
+  cfg.customPass = true;
   saveSettings();
   sendRedirect("Password changed. Hotspot restarts - reconnect with the new password");
   delay(300);
@@ -1042,6 +1041,7 @@ static void handleCommand(String line) {
       return;
     }
     cfg.adminPass = arg;
+    cfg.customPass = true;
     saveSettings();
     WiFi.softAP(apName.c_str(), cfg.adminPass.c_str());
     Serial.println("> password changed; hotspot restarted");
@@ -1109,8 +1109,9 @@ void setup() {
   delay(800);
   Serial.printf("\nESP32-S3 Network Diagnostic Tool v%s\n", FW_VERSION);
   loadSettings();
-  if (cfg.adminPass.length() < 8) {  // first boot: make a unique password
-    cfg.adminPass = randomPass();
+  if (!cfg.customPass || cfg.adminPass.length() < 8) {  // fixed easy default until you change it
+    cfg.adminPass = DEFAULT_PASS;
+    cfg.customPass = false;
     saveSettings();
   }
 
