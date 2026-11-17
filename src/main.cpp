@@ -43,8 +43,9 @@
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <esp_system.h>
+#include <esp_mac.h>
 
-#define FW_VERSION "2.1.0"
+#define FW_VERSION "2.1.1"
 
 static const int MAX_CH = 13;    // channels 1..13 allowed in the UAE
 static const int MAX_APS = 80;   // BSSIDs kept per cycle
@@ -993,6 +994,7 @@ static void printHelp() {
   Serial.println("  wifi               show hotspot / web access details");
   Serial.println("  wifi SSID|PASSWORD join your Wi-Fi (note the | between)");
   Serial.println("  wifi -             forget your Wi-Fi");
+  Serial.println("  pass NEWPASSWORD   set hotspot + web password (8+ chars)");
   Serial.println("  reset              clear persistence history");
   Serial.println("  status             show settings");
 }
@@ -1034,6 +1036,17 @@ static void handleCommand(String line) {
   } else if (cmd == "raw") { cfg.raw = (arg == "on"); saveSettings(); Serial.printf("> raw %s\n", cfg.raw ? "on" : "off"); }
   else if (cmd == "json") { cfg.json = (arg == "on"); saveSettings(); Serial.printf("> json %s\n", cfg.json ? "on" : "off"); }
   else if (cmd == "reset") { history.clear(); lastChannel.clear(); cycleNo = 0; Serial.println("> history cleared"); }
+  else if (cmd == "pass") {
+    if (arg.length() < 8 || arg.length() > 63 || arg.indexOf(' ') >= 0) {
+      Serial.println("> use: pass NEWPASSWORD  (8-63 characters, no spaces)");
+      return;
+    }
+    cfg.adminPass = arg;
+    saveSettings();
+    WiFi.softAP(apName.c_str(), cfg.adminPass.c_str());
+    Serial.println("> password changed; hotspot restarted");
+    printAccess();
+  }
   else if (cmd == "wifi") {
     if (!arg.length()) printAccess();
     else if (arg == "-") { cfg.staSsid = ""; cfg.staPass = ""; saveSettings(); WiFi.disconnect(false, true); Serial.println("> Wi-Fi forgotten"); }
@@ -1084,6 +1097,7 @@ static void stepCycle() {
     printReport(rp);
     lastReport = rp.s;
     Serial.print(lastReport);
+    printAccess();
     cycleActive = false;
   }
 }
@@ -1113,8 +1127,8 @@ void setup() {
   country.policy = WIFI_COUNTRY_POLICY_MANUAL;
   if (esp_wifi_set_country(&country) != ESP_OK) Serial.println("! could not set country (using default)");
 
-  uint8_t mac[6];
-  WiFi.macAddress(mac);
+  uint8_t mac[6] = {0};
+  esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);  // read from chip eFuse, always valid
   apName = fmt("NetDiag-%02X%02X", mac[4], mac[5]);
   WiFi.softAP(apName.c_str(), cfg.adminPass.c_str());
   startStation();
