@@ -57,7 +57,7 @@
 #include <esp_crt_bundle.h>
 #include <mbedtls/sha256.h>
 
-#define FW_VERSION "3.1.0"
+#define FW_VERSION "3.1.1"
 #define DEFAULT_PASS "netdiag123"  // public default; change it with: pass NEWPASSWORD
 
 static const int MAX_CH = 13;    // channels 1..13 allowed in the UAE
@@ -827,6 +827,16 @@ bool staWasConnected = false;
 unsigned long staRetryAt = 0;
 
 
+
+// Hotspot that shares the home internet connection (NAT), so a phone on
+// NetDiag-XXXX keeps working internet. DHCP hands out a public DNS server.
+static void startHotspot() {
+  WiFi.softAP(apName.c_str(), cfg.adminPass.c_str());
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0),
+                    IPAddress(192, 168, 4, 2), IPAddress(1, 1, 1, 1));
+  WiFi.AP.enableNAPT(true);
+}
+
 static void startStation() {
   if (!cfg.staSsid.length()) return;
   Serial.printf("> joining Wi-Fi '%s' ...\n", cfg.staSsid.c_str());
@@ -883,7 +893,7 @@ static void handleRoot() {
   h.reserve(lastReport.length() + 3500);
   h += F("<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
          "<title>NetDiag</title><style>body{font-family:sans-serif;margin:8px;background:#f4f4f4}"
-         "pre{background:#111;color:#ddd;padding:8px;font-size:11px;overflow-x:auto;white-space:pre}"
+         "pre{background:#111;color:#ddd;padding:8px;font-size:11px;white-space:pre-wrap;word-break:break-word}"
          "fieldset{background:#fff;border:1px solid #ccc;border-radius:6px;margin:8px 0}"
          "input{width:95%;padding:6px;margin:3px 0}button{padding:10px 14px;margin:4px 0}"
          ".m{background:#dfd;padding:6px;border-radius:4px}</style></head><body>");
@@ -965,7 +975,7 @@ static void handlePassword() {
   saveSettings();
   sendRedirect("Password changed. Hotspot restarts - reconnect with the new password");
   delay(300);
-  WiFi.softAP(apName.c_str(), cfg.adminPass.c_str());
+  startHotspot();
 }
 
 static void handleReset() {
@@ -1304,13 +1314,13 @@ static void runConnectionTest() {
   String err;
   float dl = downloadMbps(err);
   if (dl < 0) setStep(7, ST_FAIL, err);
-  else setStep(7, dl < 2 ? ST_WARN : ST_OK, fmt("%.1f Mbps", dl),
-               "Max ~10-20 Mbps: limited by the ESP32 and its signal, not your internet plan.");
+  else setStep(7, dl < 2 ? ST_WARN : ST_OK, fmt("%.1f Mbps (ESP32 limit ~10-20 Mbps)", dl),
+               "Measured by the ESP32's small antenna; your phone/PC will be faster. Low values here usually mean weak signal or a busy channel.");
   setStep(8, ST_RUN, "uploading for 8 s");
   err = "";
   float ul = uploadMbps(err);
   if (ul < 0) setStep(8, ST_FAIL, err);
-  else setStep(8, ul < 1 ? ST_WARN : ST_OK, fmt("%.1f Mbps", ul), "Also limited by the ESP32.");
+  else setStep(8, ul < 1 ? ST_WARN : ST_OK, fmt("%.1f Mbps (ESP32 limit)", ul), "Limited by the ESP32 and its signal.");
 }
 
 static void testTask(void *) {
@@ -1840,7 +1850,7 @@ static void handleCommand(String line) {
     cfg.adminPass = arg;
     cfg.customPass = true;
     saveSettings();
-    WiFi.softAP(apName.c_str(), cfg.adminPass.c_str());
+    startHotspot();
     Serial.println("> password changed; hotspot restarted");
     printAccess();
   }
@@ -1928,7 +1938,7 @@ void setup() {
   uint8_t mac[6] = {0};
   esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);  // read from chip eFuse, always valid
   apName = fmt("NetDiag-%02X%02X", mac[4], mac[5]);
-  WiFi.softAP(apName.c_str(), cfg.adminPass.c_str());
+  startHotspot();
   startStation();
   testMux = xSemaphoreCreateMutex();
   otaMux = xSemaphoreCreateMutex();
@@ -1951,7 +1961,7 @@ void loop() {
   bool up = WiFi.status() == WL_CONNECTED;
   if (up != staWasConnected) {
     staWasConnected = up;
-    if (up) printAccess();
+    if (up) { WiFi.AP.enableNAPT(true); printAccess(); }
     else Serial.println("> home Wi-Fi disconnected");
   }
 
