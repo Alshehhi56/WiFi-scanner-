@@ -59,7 +59,7 @@
 #include <esp_crt_bundle.h>
 #include <mbedtls/sha256.h>
 
-#define FW_VERSION "3.6.0"
+#define FW_VERSION "3.7.0"
 #define DEFAULT_PASS "netdiag123"  // public default; change it with: pass NEWPASSWORD
 
 static const int MAX_CH = 13;    // channels 1..13 allowed in the UAE
@@ -2210,10 +2210,18 @@ static String guessBrand(const String &server, const String &body) {
 }
 
 // GET gateway path; returns HTTP status, fills server header + a little body.
+// Which device to manage: a saved router IP if set, else the gateway.
+static String routerHost() {
+  String h = prefs.getString("rhost", "");
+  h.trim();
+  if (h.length()) return h;
+  return WiFi.status() == WL_CONNECTED ? WiFi.gatewayIP().toString() : String("192.168.1.1");
+}
+
 static int gwGet(const String &path, const char *user, const char *pass, String &server, String &body) {
   WiFiClient wc;
   HTTPClient http;
-  String url = "http://" + WiFi.gatewayIP().toString() + path;
+  String url = "http://" + routerHost() + path;
   if (!http.begin(wc, url)) return -1;
   http.setTimeout(6000);
   http.setConnectTimeout(6000);
@@ -2239,8 +2247,8 @@ static int gwGet(const String &path, const char *user, const char *pass, String 
 static void runRouterIdentify() {
   fixReset("Identify router & check access");
   if (WiFi.status() != WL_CONNECTED) { fixDone(ST_FAIL, "Connect the board to your Wi-Fi first."); return; }
-  String gw = WiFi.gatewayIP().toString();
-  fixLine(ST_RUN, "Contacting your router at " + gw + " ...");
+  String gw = routerHost();
+  fixLine(ST_RUN, "Contacting the router at " + gw + " ...");
   String server, body;
   int code = gwGet("/", nullptr, nullptr, server, body);
   if (code <= 0) {
@@ -2308,7 +2316,8 @@ static void runRouterVerify() {
 
 static void handleRouterPage() {
   if (!auth()) return;
-  String gw = WiFi.status() == WL_CONNECTED ? WiFi.gatewayIP().toString() : String("not connected");
+  String gwReal = WiFi.status() == WL_CONNECTED ? WiFi.gatewayIP().toString() : String("not connected");
+  String gw = routerHost();
   String brand = prefs.getString("rbrand", "");
   String u = prefs.getString("ruser", "");
   bool rok = prefs.getBool("rok", false);
@@ -2317,7 +2326,10 @@ static void handleRouterPage() {
   h += F("<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Router Access</title>");
   h += FIX_CSS;
   h += "</head><body><h2>Router Access</h2>";
-  h += "<div class='c'><div class='w'>Router (gateway): <b>" + htmlEsc(gw) + "</b>";
+  h += "<div class='c'><div class='w'>Managing router at: <b>" + htmlEsc(gw) + "</b><br>This network's gateway: " + htmlEsc(gwReal) + "</div>";
+  h += "<form method='post' action='/router/creds'><div class='w'>Router IP to manage (type 192.168.1.1 for the main router):</div>"
+       "<input name='host' value='" + htmlEsc(gw) + "' style='width:60%;padding:6px'> <button class='v'>Set</button></form>";
+  h += "<div class='w'>";
   if (brand.length()) h += "<br>Detected brand: <b>" + htmlEsc(brand) + "</b>";
   h += "<br>Access: <b>" + String(rok ? "configured" : (u.length() ? "login saved, not verified" : "not set up")) + "</b></div>";
   if (WiFi.status() != WL_CONNECTED)
@@ -2343,7 +2355,7 @@ static void handleRouterPage() {
 static String gwCapture(const String &path, int &code, String &hdr) {
   WiFiClient wc;
   HTTPClient http;
-  String url = "http://" + WiFi.gatewayIP().toString() + path;
+  String url = "http://" + routerHost() + path;
   code = -1;
   hdr = "";
   if (!http.begin(wc, url)) return "";
@@ -2372,6 +2384,7 @@ static String gwCapture(const String &path, int &code, String &hdr) {
 
 static void handleRouterCapture() {
   if (!auth()) return;
+  if (server.arg("host").length()) { String rh = server.arg("host"); rh.trim(); prefs.putString("rhost", rh); }
   String path = server.arg("path");
   path.trim();
   if (!path.length()) path = "/login.html";
@@ -2382,7 +2395,8 @@ static void handleRouterCapture() {
   h += FIX_CSS;
   h += "<style>textarea{width:95%;height:40vh;font-family:monospace;font-size:11px}</style></head><body>";
   h += "<h2>Router page capture</h2>";
-  h += "<form method='get' action='/router/capture' style='padding:0 16px'>Path on 192.168.1.1:<br>"
+  h += "<form method='get' action='/router/capture' style='padding:0 16px'>Router IP:<br>"
+       "<input name='host' value='" + htmlEsc(routerHost()) + "' style='width:70%;padding:6px'><br>Path:<br>"
        "<input name='path' value='" + htmlEsc(path) + "' style='width:70%;padding:6px'> <button class='go'>Fetch</button></form>";
   if (WiFi.status() != WL_CONNECTED) { h += "<p class='c'>Connect the board to your Wi-Fi first.</p>"; }
   else {
@@ -2402,6 +2416,7 @@ static void handleRouterCapture() {
 static void handleRouterCreds() {
   if (!auth()) return;
   if (!cfg.customPass) { server.send(403, "text/plain", "Set your own NetDiag password first (main page)."); return; }
+  if (server.arg("host").length()) { String rh = server.arg("host"); rh.trim(); prefs.putString("rhost", rh); prefs.putString("rbrand", ""); }
   String u = server.arg("u"), p = server.arg("p");
   u.trim();
   if (!u.length()) { server.sendHeader("Location", "/router"); server.send(303); return; }
