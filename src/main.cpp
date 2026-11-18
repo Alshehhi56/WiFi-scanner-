@@ -57,7 +57,7 @@
 #include <esp_crt_bundle.h>
 #include <mbedtls/sha256.h>
 
-#define FW_VERSION "3.2.0"
+#define FW_VERSION "3.3.0"
 #define DEFAULT_PASS "netdiag123"  // public default; change it with: pass NEWPASSWORD
 
 static const int MAX_CH = 13;    // channels 1..13 allowed in the UAE
@@ -918,7 +918,7 @@ static void handleRoot() {
     h += "Home LAN: not connected";
   h += String(" | Hotspot internet sharing: ") + (naptOk ? "ON" : "OFF");
   h += "</p><form method='post' action='/scan'><button>Scan now</button> <a href='/'>Refresh</a> | <a href='/api/report'>JSON</a></form>";
-  h += "<p><a href='/test' style='display:inline-block;padding:12px 18px;background:#0b2a6b;color:#fff;border-radius:22px;text-decoration:none'>Test Internet Connection &rarr;</a> <a href='/fixes' style='display:inline-block;padding:12px 18px;background:#1d7a3a;color:#fff;border-radius:22px;text-decoration:none'>Recommended fixes</a> &nbsp; <a href='/update'>Firmware &amp; system</a></p>";
+  h += "<p><a href='/test' style='display:inline-block;padding:12px 18px;background:#0b2a6b;color:#fff;border-radius:22px;text-decoration:none'>Test Internet Connection &rarr;</a> <a href='/fixes' style='display:inline-block;padding:12px 18px;background:#1d7a3a;color:#fff;border-radius:22px;text-decoration:none'>Recommended fixes</a> <a href='/router'>Router access</a> &nbsp; <a href='/update'>Firmware &amp; system</a></p>";
   h += "<pre>" + htmlEsc(lastReport) + "</pre>";
 
   h += "<form method='post' action='/settings'><fieldset><legend>Diagnostics</legend>"
@@ -1338,6 +1338,8 @@ static void runConnectionTest() {
 
 volatile bool fixRequested = false, fixRunning = false;
 static void runFixJob();
+static void runRouterIdentify();
+static void runRouterVerify();
 
 static void testTask(void *) {
   for (;;) {
@@ -1963,6 +1965,8 @@ static void runFixJob() {
   else if (id == "auto:napt") { fixReset("Turn on hotspot internet sharing"); autoNapt(); }
   else if (id == "auto:ota") { fixReset("Install firmware update"); autoOta(); }
   else if (id.startsWith("test:")) { int i = id.substring(5).toInt(); fixReset(String("Verify: ") + STEP_NAME[i]); verifyByTest(i); }
+  else if (id == "router:identify") { runRouterIdentify(); }
+  else if (id == "router:verify") { runRouterVerify(); }
   else if (id.startsWith("scan:")) { fixReset("Verify fix"); guidedVerifyScan(id.substring(5)); }
   else { fixReset("Unknown fix"); fixDone(ST_FAIL, "Unknown fix id"); }
 }
@@ -2130,6 +2134,182 @@ static void handleFixProgress() {
   server.send(200, "text/html", h);
 }
 
+// ============================================================ ROUTER ACCESS (v3.3)
+// Talks only to YOUR OWN router (the gateway reached through your Wi-Fi).
+// Step 1: identify brand + login type by reading the gateway page.
+// Step 2: check whether the router still uses a public factory-default login
+//         (a security finding in itself). This tries only the small set of
+//         well-known factory defaults for HTTP Basic auth - not a password list.
+// Step 3: if that fails, you enter the router's admin user/password; it is
+//         stored on the board's flash only, never in GitHub.
+// Reading/identifying only. Changing router settings is model-specific and will
+// always ask for confirmation (added per router model later).
+
+struct RouterCred { const char *user; const char *pass; };
+// Public factory defaults, for "is your router still on its default login?".
+static const RouterCred FACTORY_DEFAULTS[] = {
+    {"admin", "admin"}, {"admin", "password"}, {"admin", ""}, {"admin", "1234"}, {"user", "user"},
+};
+static const int NDEFAULTS = sizeof(FACTORY_DEFAULTS) / sizeof(FACTORY_DEFAULTS[0]);
+
+static String guessBrand(const String &server, const String &body) {
+  String s = server + " " + body;
+  s.toLowerCase();
+  struct { const char *k; const char *name; } T[] = {
+      {"tp-link", "TP-Link"}, {"tplink", "TP-Link"}, {"archer", "TP-Link"}, {"d-link", "D-Link"},
+      {"dlink", "D-Link"}, {"netgear", "Netgear"}, {"huawei", "Huawei"}, {"asus", "ASUS"},
+      {"tenda", "Tenda"}, {"linksys", "Linksys"}, {"zyxel", "Zyxel"}, {"mikrotik", "MikroTik"},
+      {"routeros", "MikroTik"}, {"openwrt", "OpenWrt"}, {"ubiquiti", "Ubiquiti"}, {"unifi", "Ubiquiti"},
+      {"fritz", "AVM FRITZ!Box"}, {"technicolor", "Technicolor"}, {"sagemcom", "Sagemcom"},
+      {"etisalat", "e& (Etisalat)"}, {"du ", "du"},
+  };
+  for (auto &t : T)
+    if (s.indexOf(t.k) >= 0) return t.name;
+  return "Unknown";
+}
+
+// GET gateway path; returns HTTP status, fills server header + a little body.
+static int gwGet(const String &path, const char *user, const char *pass, String &server, String &body) {
+  WiFiClient wc;
+  HTTPClient http;
+  String url = "http://" + WiFi.gatewayIP().toString() + path;
+  if (!http.begin(wc, url)) return -1;
+  http.setTimeout(6000);
+  http.setConnectTimeout(6000);
+  const char *hdrs[] = {"Server", "WWW-Authenticate"};
+  http.collectHeaders(hdrs, 2);
+  if (user) http.setAuthorization(user, pass ? pass : "");
+  int code = http.GET();
+  if (code > 0) {
+    server = http.header("Server");
+    if (!server.length()) server = http.header("WWW-Authenticate");
+    WiFiClient *st = http.getStreamPtr();
+    unsigned long t0 = millis();
+    while (body.length() < 2500 && millis() - t0 < 3000) {
+      if (st->available()) body += (char)st->read();
+      else if (!st->connected()) break;
+      else delay(2);
+    }
+  }
+  http.end();
+  return code;
+}
+
+static void runRouterIdentify() {
+  fixReset("Identify router & check access");
+  if (WiFi.status() != WL_CONNECTED) { fixDone(ST_FAIL, "Connect the board to your Wi-Fi first."); return; }
+  String gw = WiFi.gatewayIP().toString();
+  fixLine(ST_RUN, "Contacting your router at " + gw + " ...");
+  String server, body;
+  int code = gwGet("/", nullptr, nullptr, server, body);
+  if (code <= 0) {
+    fixUpdate(ST_FAIL, "No HTTP reply from " + gw);
+    fixDone(ST_WARN, "The router may use HTTPS or a non-standard page. Open http://" + gw + " yourself and tell me the brand.");
+    return;
+  }
+  String brand = guessBrand(server, body);
+  fixUpdate(ST_OK, "Reached router. Brand: " + brand + (server.length() ? " (" + server + ")" : ""));
+  prefs.putString("rbrand", brand);
+
+  bool basic = (code == 401);
+  bool form = (!basic && (body.indexOf("password") >= 0 || body.indexOf("Password") >= 0 || body.indexOf("login") >= 0));
+
+  if (basic) {
+    fixLine(ST_RUN, "Checking whether the router still uses a factory-default password...");
+    int hit = -1;
+    for (int i = 0; i < NDEFAULTS; i++) {
+      String s2, b2;
+      int c2 = gwGet("/", FACTORY_DEFAULTS[i].user, FACTORY_DEFAULTS[i].pass, s2, b2);
+      if (c2 > 0 && c2 != 401) { hit = i; break; }
+      delay(300);
+    }
+    if (hit >= 0) {
+      prefs.putString("ruser", FACTORY_DEFAULTS[hit].user);
+      prefs.putString("rpass", FACTORY_DEFAULTS[hit].pass);
+      prefs.putBool("rok", true);
+      fixUpdate(ST_WARN, fmt("Logged in with factory default: %s / %s", FACTORY_DEFAULTS[hit].user,
+                             strlen(FACTORY_DEFAULTS[hit].pass) ? FACTORY_DEFAULTS[hit].pass : "(blank)"));
+      fixDone(ST_WARN, "SECURITY RISK: your router still uses its factory login, so anyone nearby can get in. "
+                       "Change the router admin password now. Access is configured for NetDiag in the meantime.");
+    } else {
+      prefs.putBool("rok", false);
+      fixUpdate(ST_OK, "Good - the router is NOT on a factory-default password.");
+      fixDone(ST_WARN, "NetDiag could not log in automatically. Enter your router admin password below so it can manage the router.");
+    }
+  } else if (form) {
+    prefs.putBool("rok", false);
+    fixLine(ST_WARN, brand + " uses a web login form, not a simple login box.");
+    fixDone(ST_WARN, "Automatic login for this type needs a model adapter for " + brand +
+                         ". Enter your router password below and I'll add support for this model next.");
+  } else {
+    fixDone(ST_WARN, fmt("Router page returned HTTP %d. Enter your router password below, or tell me the brand.", code));
+  }
+}
+
+static void runRouterVerify() {
+  fixReset("Verify router login");
+  String u = prefs.getString("ruser", ""), p = prefs.getString("rpass", "");
+  if (!u.length()) { fixDone(ST_FAIL, "No router username saved."); return; }
+  if (WiFi.status() != WL_CONNECTED) { fixDone(ST_FAIL, "Connect the board to your Wi-Fi first."); return; }
+  fixLine(ST_RUN, "Logging in to the router as " + u + " ...");
+  String s, b;
+  int code = gwGet("/", u.c_str(), p.c_str(), s, b);
+  if (code > 0 && code != 401) {
+    prefs.putBool("rok", true);
+    fixUpdate(ST_OK, fmt("Login accepted (HTTP %d)", code));
+    fixDone(ST_OK, "Router access is configured. NetDiag can now read router pages (management features come next, per model).");
+  } else {
+    prefs.putBool("rok", false);
+    fixUpdate(ST_FAIL, code == 401 ? "Rejected (wrong username or password)" : fmt("No login (HTTP %d)", code));
+    fixDone(ST_FAIL, "Check the router admin username and password and try again. They are on the router's label if unchanged.");
+  }
+}
+
+static void handleRouterPage() {
+  if (!auth()) return;
+  String gw = WiFi.status() == WL_CONNECTED ? WiFi.gatewayIP().toString() : String("not connected");
+  String brand = prefs.getString("rbrand", "");
+  String u = prefs.getString("ruser", "");
+  bool rok = prefs.getBool("rok", false);
+  String h;
+  h.reserve(4000);
+  h += F("<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Router Access</title>");
+  h += FIX_CSS;
+  h += "</head><body><h2>Router Access</h2>";
+  h += "<div class='c'><div class='w'>Router (gateway): <b>" + htmlEsc(gw) + "</b>";
+  if (brand.length()) h += "<br>Detected brand: <b>" + htmlEsc(brand) + "</b>";
+  h += "<br>Access: <b>" + String(rok ? "configured" : (u.length() ? "login saved, not verified" : "not set up")) + "</b></div>";
+  if (WiFi.status() != WL_CONNECTED)
+    h += "<div class='w'>Connect the board to your Wi-Fi (main page) before setting up router access.</div>";
+  h += "<form method='post' action='/fix'><input type='hidden' name='id' value='router:identify'>"
+       "<button class='go'>Identify &amp; check access</button></form>";
+  h += "<div class='w'>Tries your router's factory-default login (a security check). If it fails, enter your own password below.</div></div>";
+
+  if (!cfg.customPass)
+    h += "<div class='c' style='background:#ffd27a22'>Set your own NetDiag password on the main page before saving a router login.</div>";
+  h += "<div class='c'><form method='post' action='/router/creds'><div class='t'>Router admin login</div>"
+       "<div class='w'>Stored on the board only, never in GitHub.</div>"
+       "Username<br><input name='u' value='" + htmlEsc(u) + "' style='width:90%;padding:6px'><br>"
+       "Password<br><input name='p' type='password' placeholder='(unchanged if empty)' style='width:90%;padding:6px'><br>"
+       "<button class='v'>Save &amp; verify login</button></form></div>";
+  h += "<p style='padding:0 16px'><a href='/fixes'>&larr; Fixes</a> &nbsp; <a href='/'>Main page</a></p></body></html>";
+  server.send(200, "text/html", h);
+}
+
+static void handleRouterCreds() {
+  if (!auth()) return;
+  if (!cfg.customPass) { server.send(403, "text/plain", "Set your own NetDiag password first (main page)."); return; }
+  String u = server.arg("u"), p = server.arg("p");
+  u.trim();
+  if (!u.length()) { server.sendHeader("Location", "/router"); server.send(303); return; }
+  prefs.putString("ruser", u);
+  if (p.length() || server.arg("p").length()) prefs.putString("rpass", p);
+  prefs.putBool("rok", false);
+  if (!fixRunning && !fixRequested) { fixPendingId = "router:verify"; fixReset("Verify router login"); fixRequested = true; }
+  server.sendHeader("Location", "/fix");
+  server.send(303);
+}
+
 static void startWeb() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/scan", HTTP_POST, handleScan);
@@ -2148,6 +2328,8 @@ static void startWeb() {
   server.on("/fixes", HTTP_GET, handleFixesPage);
   server.on("/fix", HTTP_POST, handleFixRun);
   server.on("/fix", HTTP_GET, handleFixProgress);
+  server.on("/router", HTTP_GET, handleRouterPage);
+  server.on("/router/creds", HTTP_POST, handleRouterCreds);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
   server.begin();
 }
