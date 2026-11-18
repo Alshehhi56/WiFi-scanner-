@@ -57,7 +57,7 @@
 #include <esp_crt_bundle.h>
 #include <mbedtls/sha256.h>
 
-#define FW_VERSION "3.1.2"
+#define FW_VERSION "3.2.0"
 #define DEFAULT_PASS "netdiag123"  // public default; change it with: pass NEWPASSWORD
 
 static const int MAX_CH = 13;    // channels 1..13 allowed in the UAE
@@ -918,7 +918,7 @@ static void handleRoot() {
     h += "Home LAN: not connected";
   h += String(" | Hotspot internet sharing: ") + (naptOk ? "ON" : "OFF");
   h += "</p><form method='post' action='/scan'><button>Scan now</button> <a href='/'>Refresh</a> | <a href='/api/report'>JSON</a></form>";
-  h += "<p><a href='/test' style='display:inline-block;padding:12px 18px;background:#0b2a6b;color:#fff;border-radius:22px;text-decoration:none'>Test Internet Connection &rarr;</a> &nbsp; <a href='/update'>Firmware &amp; system</a></p>";
+  h += "<p><a href='/test' style='display:inline-block;padding:12px 18px;background:#0b2a6b;color:#fff;border-radius:22px;text-decoration:none'>Test Internet Connection &rarr;</a> <a href='/fixes' style='display:inline-block;padding:12px 18px;background:#1d7a3a;color:#fff;border-radius:22px;text-decoration:none'>Recommended fixes</a> &nbsp; <a href='/update'>Firmware &amp; system</a></p>";
   h += "<pre>" + htmlEsc(lastReport) + "</pre>";
 
   h += "<form method='post' action='/settings'><fieldset><legend>Diagnostics</legend>"
@@ -1336,6 +1336,9 @@ static void runConnectionTest() {
   else setStep(8, ul < 1 ? ST_WARN : ST_OK, fmt("%.1f Mbps (ESP32 limit)", ul), "Limited by the ESP32 and its signal.");
 }
 
+volatile bool fixRequested = false, fixRunning = false;
+static void runFixJob();
+
 static void testTask(void *) {
   for (;;) {
     if (testRequested) {
@@ -1350,6 +1353,12 @@ static void testTask(void *) {
         Serial.printf("%-20s %-11s %s\n", STEP_NAME[i], STEP_STATE[steps[i].st], steps[i].value);
         if (steps[i].note[0] && steps[i].st != ST_OK) Serial.printf("   -> %s\n", steps[i].note);
       }
+    }
+    if (fixRequested) {
+      fixRequested = false;
+      fixRunning = true;
+      runFixJob();
+      fixRunning = false;
     }
     delay(100);
   }
@@ -1381,7 +1390,7 @@ static void handleTestPage() {
   if (testMux) xSemaphoreGive(testMux);
   if (testRunning || testRequested) h += F("<p style='padding:0 16px'>Testing... about 45 seconds. This page refreshes itself.</p>");
   else h += F("<form method='post' action='/test'><button>Test Internet Connection</button></form>");
-  h += F("<a href='/'>&larr; Back to Wi-Fi report</a><br><br></body></html>");
+  h += F("<a href='/fixes' style='color:#7dffa1'>Recommended fixes &rarr;</a><br><a href='/'>&larr; Back to Wi-Fi report</a><br><br></body></html>");
   server.send(200, "text/html", h);
 }
 
@@ -1776,6 +1785,351 @@ static void handleInfo() {
   server.send(200, "application/json", j);
 }
 
+// ============================================================ FIX CENTER (v3.2)
+// Every recommendation becomes a fix card:
+//  AUTO   - the board fixes it itself (one click), shows progress, then re-checks.
+//  GUIDED - router-side change; step-by-step instructions + one-click verify
+//           (rescan or retest) that confirms whether the problem is gone.
+struct FixItem {
+  String id, title, why, how;
+  Sev sev;
+  bool autoFix;
+};
+
+static const int FIX_LINES = 10;
+struct FixLine {
+  StepState st;
+  char text[140];
+};
+FixLine fixLines[FIX_LINES];
+int fixLineCount = 0;
+String fixTitle, fixResult, fixJobId;
+StepState fixResultState = ST_WAIT;
+String fixPendingId;
+
+static void fixReset(const String &title) {
+  if (testMux) xSemaphoreTake(testMux, portMAX_DELAY);
+  fixLineCount = 0;
+  fixTitle = title;
+  fixResult = "";
+  fixResultState = ST_RUN;
+  if (testMux) xSemaphoreGive(testMux);
+}
+static void fixLine(StepState st, const String &t) {
+  if (testMux) xSemaphoreTake(testMux, portMAX_DELAY);
+  if (fixLineCount < FIX_LINES) {
+    fixLines[fixLineCount].st = st;
+    strlcpy(fixLines[fixLineCount].text, t.c_str(), sizeof(fixLines[0].text));
+    fixLineCount++;
+  }
+  if (testMux) xSemaphoreGive(testMux);
+  Serial.printf("  [fix] %s %s\n", STEP_STATE[st], t.c_str());
+}
+static void fixUpdate(StepState st, const String &t) {  // change the last line
+  if (testMux) xSemaphoreTake(testMux, portMAX_DELAY);
+  if (fixLineCount > 0) {
+    fixLines[fixLineCount - 1].st = st;
+    strlcpy(fixLines[fixLineCount - 1].text, t.c_str(), sizeof(fixLines[0].text));
+  }
+  if (testMux) xSemaphoreGive(testMux);
+}
+static void fixDone(StepState st, const String &r) {
+  if (testMux) xSemaphoreTake(testMux, portMAX_DELAY);
+  fixResultState = st;
+  fixResult = r;
+  if (testMux) xSemaphoreGive(testMux);
+  Serial.printf("  [fix] RESULT: %s\n", r.c_str());
+}
+
+static bool findingPresent(const String &id) {
+  for (auto &f : findings)
+    if (f.id == id) return true;
+  return false;
+}
+
+// Run a fresh Wi-Fi scan cycle and wait for it to finish.
+static bool rescanAndWait() {
+  uint32_t target = cycleNo + (cycleActive ? 2 : 1);
+  scanRequested = true;
+  unsigned long t0 = millis();
+  while ((cycleNo < target || cycleActive) && millis() - t0 < 120000) delay(200);
+  return cycleNo >= target && !cycleActive;
+}
+
+static bool waitConnected(unsigned long ms) {
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < ms) delay(200);
+  return WiFi.status() == WL_CONNECTED;
+}
+
+static void verifyByTest(int stepIdx) {
+  fixLine(ST_RUN, "Re-running the connection test...");
+  testRunning = true;
+  runConnectionTest();
+  testRunning = false;
+  StepState s = steps[stepIdx].st;
+  fixUpdate(s == ST_OK ? ST_OK : s, String(STEP_NAME[stepIdx]) + ": " + STEP_STATE[s] + " - " + steps[stepIdx].value);
+  if (s == ST_OK) fixDone(ST_OK, "Fixed - " + String(STEP_NAME[stepIdx]) + " now passes.");
+  else fixDone(s == ST_FAIL ? ST_FAIL : ST_WARN, "Not fixed yet. " + String(steps[stepIdx].note));
+}
+
+static void autoReconnect() {
+  if (!cfg.staSsid.length()) { fixLine(ST_FAIL, "No home Wi-Fi saved"); fixDone(ST_FAIL, "Enter your Wi-Fi on the main page first."); return; }
+  fixLine(ST_RUN, "Disconnecting from " + cfg.staSsid);
+  WiFi.disconnect();
+  delay(800);
+  fixUpdate(ST_OK, "Disconnected");
+  fixLine(ST_RUN, "Connecting and requesting a new IP (DHCP)...");
+  startStation();
+  if (!waitConnected(25000)) { fixUpdate(ST_FAIL, "Could not connect"); fixDone(ST_FAIL, "Not fixed: check the password and signal (move closer to the router)."); return; }
+  fixUpdate(ST_OK, "Connected: " + WiFi.localIP().toString() + fmt(" at %d dBm", WiFi.RSSI()));
+  naptOk = WiFi.AP.enableNAPT(true);
+  verifyByTest(2);
+}
+
+static void autoRoam() {
+  fixLine(ST_RUN, "Looking for a stronger access point for " + cfg.staSsid);
+  int cur = WiFi.RSSI();
+  uint8_t curB[6];
+  memcpy(curB, WiFi.BSSID() ? WiFi.BSSID() : (const uint8_t *)"\0\0\0\0\0\0", 6);
+  int best = -1;
+  for (size_t i = 0; i < aps.size(); i++) {
+    if (aps[i].ssid != cfg.staSsid || memcmp(aps[i].bssid, curB, 6) == 0) continue;
+    if (best < 0 || aps[i].avg() > aps[best].avg()) best = i;
+  }
+  if (best < 0 || aps[best].avg() < cur + 6) {
+    fixUpdate(ST_WARN, fmt("No access point clearly stronger than the current one (%d dBm)", cur));
+    fixDone(ST_WARN, "Nothing to switch to. Move the board closer, or follow the guided channel / width fixes.");
+    return;
+  }
+  ApObs &b = aps[best];
+  fixUpdate(ST_OK, fmt("Found %s on ch %d at %.0f dBm (now %d dBm)", macStr(b.bssid).c_str(), b.ch, b.avg(), cur));
+  fixLine(ST_RUN, "Switching to it...");
+  WiFi.disconnect();
+  delay(500);
+  WiFi.begin(cfg.staSsid.c_str(), cfg.staPass.c_str(), b.ch, b.bssid);
+  if (!waitConnected(25000)) {
+    fixUpdate(ST_FAIL, "Switch failed - returning to normal connection");
+    startStation();
+    waitConnected(20000);
+    fixDone(ST_FAIL, "Not fixed: the stronger access point did not accept the connection.");
+    return;
+  }
+  fixUpdate(ST_OK, fmt("Now on %s at %d dBm", WiFi.BSSIDstr().c_str(), WiFi.RSSI()));
+  naptOk = WiFi.AP.enableNAPT(true);
+  verifyByTest(2);
+}
+
+static void autoNapt() {
+  fixLine(ST_RUN, "Turning on hotspot internet sharing...");
+  if (WiFi.status() != WL_CONNECTED) { fixUpdate(ST_FAIL, "Board is not connected to your Wi-Fi"); fixDone(ST_FAIL, "Connect the board to your Wi-Fi first."); return; }
+  startHotspot();
+  delay(1000);
+  if (naptOk) { fixUpdate(ST_OK, "Sharing is ON"); fixDone(ST_OK, "Fixed - reconnect your phone to the hotspot."); }
+  else { fixUpdate(ST_FAIL, "Sharing could not start"); fixDone(ST_FAIL, "Not fixed - send me the serial log."); }
+}
+
+static void autoOta() {
+  fixLine(ST_RUN, "Starting firmware update...");
+  otaInstallReq = true;
+  unsigned long t0 = millis();
+  delay(500);
+  while ((otaBusy || otaInstallReq) && millis() - t0 < 240000) {
+    fixUpdate(ST_RUN, getOta());
+    delay(500);
+  }
+  fixUpdate(ST_WARN, getOta());
+  fixDone(ST_WARN, getOta());
+}
+
+static void guidedVerifyScan(const String &findingId) {
+  fixLine(ST_RUN, "Scanning Wi-Fi again to check your change...");
+  if (!rescanAndWait()) { fixUpdate(ST_FAIL, "Scan did not finish"); fixDone(ST_FAIL, "Try again."); return; }
+  fixUpdate(ST_OK, fmt("Scan complete (cycle %u)", cycleNo));
+  if (findingPresent(findingId)) {
+    fixLine(ST_WARN, "The problem is still detected");
+    fixDone(ST_WARN, "Not fixed yet. Check the setting was saved; routers can take 1-2 minutes to apply it.");
+  } else {
+    fixLine(ST_OK, "The problem is no longer detected");
+    fixDone(ST_OK, "Fixed - confirmed by a new scan.");
+  }
+}
+
+static void runFixJob() {
+  String id = fixPendingId;
+  fixJobId = id;
+  if (id == "auto:reconnect") { fixReset("Reconnect & renew IP address"); autoReconnect(); }
+  else if (id == "auto:roam") { fixReset("Switch to a stronger access point"); autoRoam(); }
+  else if (id == "auto:napt") { fixReset("Turn on hotspot internet sharing"); autoNapt(); }
+  else if (id == "auto:ota") { fixReset("Install firmware update"); autoOta(); }
+  else if (id.startsWith("test:")) { int i = id.substring(5).toInt(); fixReset(String("Verify: ") + STEP_NAME[i]); verifyByTest(i); }
+  else if (id.startsWith("scan:")) { fixReset("Verify fix"); guidedVerifyScan(id.substring(5)); }
+  else { fixReset("Unknown fix"); fixDone(ST_FAIL, "Unknown fix id"); }
+}
+
+// ---- build the list of recommended fixes from all current results
+static String routerSteps(const String &setting) {
+  String gw = WiFi.status() == WL_CONNECTED ? WiFi.gatewayIP().toString() : String("192.168.1.1");
+  return "<ol><li>Open your router page: <a href='http://" + gw + "' target='_blank'>http://" + gw + "</a> and log in "
+         "(admin password is often on the router's label).</li><li>Go to <b>Wireless / Wi-Fi &rarr; 2.4 GHz</b>.</li><li>" +
+         setting + "</li><li>Tap <b>Save / Apply</b>. Wi-Fi drops for ~30 s.</li><li>Come back and tap <b>I've done it - verify</b>.</li></ol>";
+}
+
+static void buildFixes(std::vector<FixItem> &out) {
+  out.clear();
+  auto add = [&](const String &id, Sev s, const String &t, const String &why, const String &how, bool a) {
+    FixItem f; f.id = id; f.sev = s; f.title = t; f.why = why; f.how = how; f.autoFix = a; out.push_back(f);
+  };
+  bool up = WiFi.status() == WL_CONNECTED;
+
+  // board / connection
+  if (cfg.staSsid.length() && !up)
+    add("auto:reconnect", SEV_CRIT, "Reconnect to " + cfg.staSsid, "The board is not connected to your Wi-Fi.", "", true);
+  if (up && !naptOk)
+    add("auto:napt", SEV_WARN, "Share internet through the hotspot", "Phones on NetDiag have no internet.", "", true);
+  if (up && WiFi.RSSI() < -75) {
+    bool better = false;
+    for (auto &a : aps)
+      if (a.ssid == cfg.staSsid && a.avg() >= WiFi.RSSI() + 6 && (!WiFi.BSSID() || memcmp(a.bssid, WiFi.BSSID(), 6))) better = true;
+    if (better) add("auto:roam", SEV_WARN, "Switch to a stronger access point", fmt("Board signal is %d dBm; a stronger AP with the same name is nearby.", WiFi.RSSI()), "", true);
+  }
+  if (otaLatestVer.length() && verNum(otaLatestVer) > verNum(FW_VERSION))
+    add("auto:ota", SEV_INFO, "Install firmware v" + otaLatestVer, "A newer version is available.", "", true);
+  if (!cfg.customPass)
+    add("guide:pass", SEV_WARN, "Set your own NetDiag password", "The default password is public in the GitHub code.",
+        "<ol><li>Open the <a href='/'>main page</a>.</li><li>Scroll to <b>Admin / hotspot password</b>.</li><li>Enter a new password twice and tap <b>Change</b>.</li></ol>", false);
+
+  // connection-test results
+  if (testCount) {
+    for (int i = 0; i < NSTEPS; i++) {
+      if (steps[i].st != ST_WARN && steps[i].st != ST_FAIL) continue;
+      Sev s = steps[i].st == ST_FAIL ? SEV_CRIT : SEV_WARN;
+      String how;
+      if (i == 0 || i == 2) how = "<ol><li>Try the automatic <b>Reconnect</b> fix, or move the board closer to the router.</li>"
+                                  "<li>Apply the channel / 20 MHz fixes below if listed.</li><li>Tap verify.</li></ol>";
+      else if (i == 3) how = routerSteps("Find <b>DNS</b> (often under Internet/WAN or DHCP) and set <b>1.1.1.1</b> and <b>8.8.8.8</b>.");
+      else if (i == 4 || i == 5) how = "<ol><li>Restart the router (power off 30 s).</li><li>If it continues, contact your ISP with this result.</li><li>Tap verify.</li></ol>";
+      else if (i == 6) how = routerSteps("Find <b>UPnP</b> (often under Advanced/NAT) and enable it. If you have two routers, set one to <b>bridge/AP mode</b>.");
+      else how = "<ol><li>Move the board closer to the router and tap verify.</li></ol>";
+      add("test:" + String(i), s, String(STEP_NAME[i]) + ": " + STEP_STATE[steps[i].st], String(steps[i].value) + ". " + steps[i].note, how, false);
+      if ((i == 0 || i == 1 || i == 2) && cfg.staSsid.length())
+        add("auto:reconnect", s, "Reconnect & renew IP address", "Often clears a stuck or poor connection.", "", true);
+    }
+  }
+
+  // Wi-Fi scan findings (warnings and critical)
+  for (auto &f : findings) {
+    if (f.sev < SEV_WARN && f.id != "nohome") continue;
+    String how;
+    String id = f.id;
+    if (id.startsWith("nonstd:") || id.startsWith("chan:")) {
+      int ch = 0;
+      int p = f.action.indexOf("channel ");
+      if (id.startsWith("chan:")) p = f.action.indexOf("-> ");
+      if (p >= 0) ch = f.action.substring(p + (id.startsWith("chan:") ? 3 : 8)).toInt();
+      how = routerSteps(fmt("Set <b>Channel</b> to <b>%d</b> (not Auto).", ch));
+    } else if (id.startsWith("width:")) how = routerSteps("Set <b>Channel width / Bandwidth</b> to <b>20 MHz</b>.");
+    else if (id.startsWith("open:") || id.startsWith("wep:") || id.startsWith("wpa1:") || id.startsWith("mixed:") || id.startsWith("tkip:"))
+      how = routerSteps("Set <b>Security</b> to <b>WPA2-PSK</b> (or WPA2/WPA3) and <b>Encryption</b> to <b>AES</b>.");
+    else if (id.startsWith("wps:")) how = routerSteps("Find <b>WPS</b> and set it to <b>Disabled</b>.");
+    else if (id.startsWith("legacy:")) how = routerSteps("Set <b>Mode</b> to <b>802.11 b/g/n</b> (or b/g/n/ax).");
+    else if (id.startsWith("guestsec:")) how = routerSteps("Open <b>Guest network</b>: set a WPA2 password and enable <b>client isolation</b>.");
+    else if (id.startsWith("extssid:") || id.startsWith("authdiff:"))
+      how = "<ol><li>Open the extender's settings page (see its label or app).</li><li>Set the same <b>network name, password and security</b> as the main router.</li><li>Save, wait 1 minute, tap verify.</li></ol>";
+    else if (id == "nohome") how = "<ol><li>On the <a href='/'>main page</a>, enter your network names under <b>Your networks</b> and tap Save.</li></ol>";
+    else how = "<ol><li>" + htmlEsc(f.action) + "</li><li>Tap verify.</li></ol>";
+    add("scan:" + id, f.sev, f.test + ": " + f.finding, f.evidence, how, false);
+  }
+
+  // de-duplicate (reconnect can be added twice) and sort by severity
+  std::vector<FixItem> uniq;
+  for (auto &f : out) {
+    bool dup = false;
+    for (auto &u : uniq) if (u.id == f.id) dup = true;
+    if (!dup) uniq.push_back(f);
+  }
+  std::stable_sort(uniq.begin(), uniq.end(), [](const FixItem &a, const FixItem &b) { return a.sev > b.sev; });
+  out = uniq;
+}
+
+static const char *FIX_CSS =
+    "<style>body{font-family:sans-serif;margin:0;background:linear-gradient(#0b2a6b,#061538);color:#fff;min-height:100vh}"
+    "h2{font-weight:300;margin:0;padding:16px}.c{background:#ffffff12;margin:10px;padding:12px;border-radius:10px}"
+    ".t{font-size:16px}.w{font-size:12px;color:#c8d3f0;margin:6px 0}.b{display:inline-block;font-size:11px;padding:2px 8px;"
+    "border-radius:10px;margin-right:6px}.CRIT{background:#ff7d7d;color:#300}.WARN{background:#ffd27a;color:#330}"
+    ".INFO{background:#7dc8ff;color:#023}button{padding:10px 18px;border-radius:20px;border:0;font-size:15px;margin-top:6px}"
+    ".go{background:#7dffa1;color:#032}.v{background:#fff;color:#0b2a6b}details{font-size:13px;color:#dde}a{color:#9fc3ff}"
+    "ol{padding-left:20px}.row{border-top:1px solid #ffffff22;padding:10px 16px;font-size:14px}.s{float:right;font-weight:bold}"
+    ".OK{color:#7dffa1}.RUN{color:#7dc8ff}.FAIL{color:#ff7d7d}.WARNs{color:#ffd27a}</style>";
+
+static void handleFixesPage() {
+  if (!auth()) return;
+  std::vector<FixItem> list;
+  buildFixes(list);
+  String h;
+  h.reserve(8000);
+  h += F("<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Fixes</title>");
+  h += FIX_CSS;
+  h += "</head><body><h2>Recommended Fixes</h2>";
+  if (testRunning || fixRunning) h += "<p class='c'>A test or fix is running - <a href='/fix'>see progress</a></p>";
+  if (!testCount) h += "<p class='c'>Tip: run <a href='/test'>Test Internet Connection</a> first to include connection fixes.</p>";
+  if (list.empty()) h += "<p class='c'>No problems to fix right now.</p>";
+  for (auto &f : list) {
+    const char *sv = f.sev == SEV_CRIT ? "CRIT" : f.sev == SEV_WARN ? "WARN" : "INFO";
+    h += "<div class='c'><span class='b " + String(sv) + "'>" + (f.sev == SEV_CRIT ? "Critical" : f.sev == SEV_WARN ? "Warning" : "Info") +
+         "</span><span class='b' style='background:#ffffff22'>" + (f.autoFix ? "Automatic" : "Guided") + "</span>";
+    h += "<div class='t'>" + htmlEsc(f.title) + "</div><div class='w'>" + htmlEsc(f.why) + "</div>";
+    h += "<form method='post' action='/fix'><input type='hidden' name='id' value='" + htmlEsc(f.id) + "'>";
+    if (f.autoFix) h += "<button class='go'>Fix now</button>";
+    else if (f.id.startsWith("guide:")) h += "";
+    else {
+      h += "<details><summary>Show me how</summary>" + f.how + "</details><button class='v'>I've done it - verify</button>";
+    }
+    if (f.id.startsWith("guide:")) h += "<details open><summary>How</summary>" + f.how + "</details>";
+    h += "</form></div>";
+  }
+  h += "<p style='padding:0 16px'><a href='/'>&larr; Main page</a> &nbsp; <a href='/test'>Connection test</a></p></body></html>";
+  server.send(200, "text/html", h);
+}
+
+static void handleFixRun() {
+  if (!auth()) return;
+  String id = server.arg("id");
+  if (!fixRunning && !testRunning && !fixRequested && id.length()) {
+    fixPendingId = id;
+    fixReset("Starting...");
+    fixRequested = true;
+  }
+  server.sendHeader("Location", "/fix");
+  server.send(303);
+}
+
+static void handleFixProgress() {
+  if (!auth()) return;
+  String h;
+  h.reserve(4000);
+  bool running = fixRunning || fixRequested;
+  h += F("<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
+  if (running) h += F("<meta http-equiv='refresh' content='2'>");
+  h += "<title>Fixing</title>";
+  h += FIX_CSS;
+  h += "</head><body>";
+  if (testMux) xSemaphoreTake(testMux, portMAX_DELAY);
+  h += "<h2>" + htmlEsc(fixTitle.length() ? fixTitle : String("No fix started")) + "</h2>";
+  static const char *cls[] = {"", "RUN", "OK", "WARNs", "FAIL", ""};
+  for (int i = 0; i < fixLineCount; i++)
+    h += "<div class='row'><span class='s " + String(cls[fixLines[i].st]) + "'>" + STEP_STATE[fixLines[i].st] + "</span>" +
+         htmlEsc(fixLines[i].text) + "</div>";
+  if (running) h += "<p style='padding:0 16px'>Working... this page updates itself.</p>";
+  else if (fixResult.length()) {
+    const char *c = fixResultState == ST_OK ? "OK" : fixResultState == ST_FAIL ? "FAIL" : "WARNs";
+    h += "<div class='c'><div class='t " + String(c) + "'>" + (fixResultState == ST_OK ? "&#10004; " : "&#9888; ") + htmlEsc(fixResult) + "</div></div>";
+  }
+  if (testMux) xSemaphoreGive(testMux);
+  h += "<p style='padding:0 16px'><a href='/fixes'>&larr; All fixes</a> &nbsp; <a href='/'>Main page</a></p></body></html>";
+  server.send(200, "text/html", h);
+}
+
 static void startWeb() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/scan", HTTP_POST, handleScan);
@@ -1791,6 +2145,9 @@ static void startWeb() {
   server.on("/ota", HTTP_POST, handleOtaAction);
   server.on("/rollback", HTTP_POST, handleRollback);
   server.on("/api/info", HTTP_GET, handleInfo);
+  server.on("/fixes", HTTP_GET, handleFixesPage);
+  server.on("/fix", HTTP_POST, handleFixRun);
+  server.on("/fix", HTTP_GET, handleFixProgress);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
   server.begin();
 }
