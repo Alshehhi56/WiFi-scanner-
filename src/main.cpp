@@ -57,7 +57,7 @@
 #include <esp_crt_bundle.h>
 #include <mbedtls/sha256.h>
 
-#define FW_VERSION "3.3.0"
+#define FW_VERSION "3.4.0"
 #define DEFAULT_PASS "netdiag123"  // public default; change it with: pass NEWPASSWORD
 
 static const int MAX_CH = 13;    // channels 1..13 allowed in the UAE
@@ -77,6 +77,40 @@ static String fmt(const char *f, ...) {
 
 static String macStr(const uint8_t *m) {
   return fmt("%02X:%02X:%02X:%02X:%02X:%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
+}
+
+// Manufacturer from the first 3 MAC bytes (OUI). Small common-vendor table,
+// focused on home routers/extenders in the region; "?" when not listed.
+struct Oui { uint8_t a, b, c; const char *name; };
+static const Oui OUI_TABLE[] = {
+  // TP-Link
+  {0x50,0xC7,0xBF,"TP-Link"},{0xEC,0x08,0x6B,"TP-Link"},{0x60,0x32,0xB1,"TP-Link"},{0xA4,0x2B,0xB0,"TP-Link"},
+  {0x14,0xCC,0x20,"TP-Link"},{0x98,0xDA,0xC4,"TP-Link"},{0x1C,0x61,0xB4,"TP-Link"},{0x54,0xAF,0x97,"TP-Link"},
+  // D-Link
+  {0x1C,0xBD,0xB9,"D-Link"},{0x84,0xC9,0xB2,"D-Link"},{0xC8,0xD3,0xA3,"D-Link"},{0x78,0x54,0x2E,"D-Link"},
+  // Netgear
+  {0x9C,0xD3,0x6D,"Netgear"},{0xA0,0x40,0xA0,"Netgear"},{0x3C,0x37,0x86,"Netgear"},{0x20,0xE5,0x2A,"Netgear"},
+  // Huawei / Honor
+  {0x00,0xE0,0xFC,"Huawei"},{0x48,0x62,0x76,"Huawei"},{0x5C,0x7D,0x5E,"Huawei"},{0xD4,0x6A,0xA8,"Huawei"},
+  {0xAC,0xE2,0x15,"Huawei"},{0x10,0x47,0x80,"Huawei"},
+  // Tenda / Mercury
+  {0xC8,0x3A,0x35,"Tenda"},{0x04,0x95,0xE6,"Tenda"},{0xD8,0x32,0x14,"Tenda"},
+  // ASUS
+  {0x2C,0xFD,0xA1,"ASUS"},{0x04,0xD4,0xC4,"ASUS"},{0x38,0xD5,0x47,"ASUS"},{0xAC,0x9E,0x17,"ASUS"},
+  // Xiaomi
+  {0x64,0x09,0x80,"Xiaomi"},{0x28,0x6C,0x07,"Xiaomi"},{0xF0,0xB4,0x29,"Xiaomi"},
+  // Zyxel / Sagemcom / Technicolor / Arcadyan (ISP boxes)
+  {0x5C,0xE2,0x8C,"Zyxel"},{0xA0,0xE4,0x53,"Zyxel"},{0x44,0xD4,0x37,"Sagemcom"},{0x98,0x2C,0xBE,"Technicolor"},
+  {0x7C,0x26,0x64,"Technicolor"},{0x88,0x03,0x55,"Arcadyan"},
+  // Ubiquiti, Linksys, Realtek
+  {0x24,0xA4,0x3C,"Ubiquiti"},{0xFC,0xEC,0xDA,"Ubiquiti"},{0x48,0xF8,0xB3,"Linksys"},{0x00,0xE0,0x4C,"Realtek"},
+  // Espressif (NetDiag itself / ESP devices)
+  {0x7C,0xDF,0xA1,"Espressif"},{0x24,0x6F,0x28,"Espressif"},{0x34,0x85,0x18,"Espressif"},{0xF4,0x12,0xFA,"Espressif"},
+};
+static String vendorFromMac(const uint8_t *m) {
+  for (auto &o : OUI_TABLE)
+    if (o.a == m[0] && o.b == m[1] && o.c == m[2]) return String(o.name);
+  return String("?");
 }
 
 // ------------------------------------------------------------ settings
@@ -615,9 +649,11 @@ static void analyse() {
       if (!b.first.startsWith(a.first)) continue;
       String suf = upperNoSep(b.first.substring(a.first.length()));
       if (suf.startsWith("EXT") || suf.startsWith("RPT") || suf.startsWith("REPEAT")) {
+        String ev = b.second.empty() ? String("name = ") + a.first + " + suffix"
+                                      : "made by " + vendorFromMac(aps[b.second[0]].bssid) + ", name = " + a.first + " + suffix";
         addF("extssid:" + b.first, SEV_WARN, CONF_LIKELY, "Access points",
-             b.first + " looks like an extender with its own SSID",
-             "name = " + a.first + " + suffix", "Separate names stop phones moving between them automatically. Give the extender the same SSID and password, or use mesh / wired AP mode");
+             b.first + " looks like an extender with its own SSID", ev,
+             "Separate names stop phones moving between them automatically. Give the extender the same SSID and password, or use mesh / wired AP mode");
       }
     }
   }
@@ -733,16 +769,16 @@ static void printReport(Print &out) {
 
   if (cfg.raw) {
     out.println("\n-- ACCESS POINTS (avg dBm, spread, seen) --");
-    out.println("CH  W   RSSI  SD SEEN SEC      PHY  SSID");
+    out.println("CH  W   RSSI  SD SEEN SEC      PHY  VENDOR    SSID");
     std::vector<int> order(aps.size());
     for (size_t i = 0; i < aps.size(); i++) order[i] = i;
     std::sort(order.begin(), order.end(), [](int x, int y) { return aps[x].avg() > aps[y].avg(); });
     for (int i : order) {
       ApObs &a = aps[i];
-      out.printf("%2d %s %5.0f %3.0f  %d/%d %-8s %-4s %s%s %s\n", a.ch,
+      out.printf("%2d %s %5.0f %3.0f  %d/%d %-8s %-4s %-9s %s%s %s\n", a.ch,
                     a.second ? "40" : "20", a.avg(), a.sd(), a.seen, roundsDone, authName(a.auth),
-                    phyName(a), isHome(a.ssid) ? "*" : "", a.hidden() ? "<hidden>" : a.ssid.c_str(),
-                    macStr(a.bssid).substring(9).c_str());
+                    phyName(a), vendorFromMac(a.bssid).c_str(), isHome(a.ssid) ? "*" : "",
+                    a.hidden() ? "<hidden>" : a.ssid.c_str(), macStr(a.bssid).substring(9).c_str());
     }
     out.println("(* = your network, last 3 MAC bytes shown)");
   }
