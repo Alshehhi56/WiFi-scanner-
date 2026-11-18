@@ -57,7 +57,7 @@
 #include <esp_crt_bundle.h>
 #include <mbedtls/sha256.h>
 
-#define FW_VERSION "3.1.1"
+#define FW_VERSION "3.1.2"
 #define DEFAULT_PASS "netdiag123"  // public default; change it with: pass NEWPASSWORD
 
 static const int MAX_CH = 13;    // channels 1..13 allowed in the UAE
@@ -830,11 +830,23 @@ unsigned long staRetryAt = 0;
 
 // Hotspot that shares the home internet connection (NAT), so a phone on
 // NetDiag-XXXX keeps working internet. DHCP hands out a public DNS server.
+#if defined(CONFIG_LWIP_IPV4_NAPT) && CONFIG_LWIP_IPV4_NAPT
+#warning "NAPT_PROBE: CONFIG_LWIP_IPV4_NAPT enabled"
+#else
+#warning "NAPT_PROBE: CONFIG_LWIP_IPV4_NAPT NOT enabled"
+#endif
+#if defined(CONFIG_LWIP_IP_FORWARD) && CONFIG_LWIP_IP_FORWARD
+#warning "NAPT_PROBE: CONFIG_LWIP_IP_FORWARD enabled"
+#else
+#warning "NAPT_PROBE: CONFIG_LWIP_IP_FORWARD NOT enabled"
+#endif
+bool naptOk = false;
 static void startHotspot() {
   WiFi.softAP(apName.c_str(), cfg.adminPass.c_str());
   WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0),
                     IPAddress(192, 168, 4, 2), IPAddress(1, 1, 1, 1));
-  WiFi.AP.enableNAPT(true);
+  naptOk = WiFi.AP.enableNAPT(true);
+  Serial.printf("> internet sharing (NAT) %s\n", naptOk ? "on" : "FAILED");
 }
 
 static void startStation() {
@@ -904,6 +916,7 @@ static void handleRoot() {
     h += "Home LAN: " + htmlEsc(cfg.staSsid) + " " + WiFi.localIP().toString() + fmt(" (%d dBm)", WiFi.RSSI());
   else
     h += "Home LAN: not connected";
+  h += String(" | Hotspot internet sharing: ") + (naptOk ? "ON" : "OFF");
   h += "</p><form method='post' action='/scan'><button>Scan now</button> <a href='/'>Refresh</a> | <a href='/api/report'>JSON</a></form>";
   h += "<p><a href='/test' style='display:inline-block;padding:12px 18px;background:#0b2a6b;color:#fff;border-radius:22px;text-decoration:none'>Test Internet Connection &rarr;</a> &nbsp; <a href='/update'>Firmware &amp; system</a></p>";
   h += "<pre>" + htmlEsc(lastReport) + "</pre>";
@@ -1961,7 +1974,7 @@ void loop() {
   bool up = WiFi.status() == WL_CONNECTED;
   if (up != staWasConnected) {
     staWasConnected = up;
-    if (up) { WiFi.AP.enableNAPT(true); printAccess(); }
+    if (up) { naptOk = WiFi.AP.enableNAPT(true); Serial.printf("> internet sharing (NAT) %s\n", naptOk ? "on" : "FAILED"); printAccess(); }
     else Serial.println("> home Wi-Fi disconnected");
   }
 
