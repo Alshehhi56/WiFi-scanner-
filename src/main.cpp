@@ -44,8 +44,13 @@
 #include <ESPmDNS.h>
 #include <esp_system.h>
 #include <esp_mac.h>
+#include <WiFiUdp.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include "ping/ping_sock.h"
+#include "lwip/ip_addr.h"
 
-#define FW_VERSION "2.1.2"
+#define FW_VERSION "3.0.0"
 #define DEFAULT_PASS "netdiag123"  // public default; change it with: pass NEWPASSWORD
 
 static const int MAX_CH = 13;    // channels 1..13 allowed in the UAE
@@ -883,6 +888,7 @@ static void handleRoot() {
   else
     h += "Home LAN: not connected";
   h += "</p><form method='post' action='/scan'><button>Scan now</button> <a href='/'>Refresh</a> | <a href='/api/report'>JSON</a></form>";
+  h += "<p><a href='/test' style='display:inline-block;padding:12px 18px;background:#0b2a6b;color:#fff;border-radius:22px;text-decoration:none'>Test Internet Connection &rarr;</a></p>";
   h += "<pre>" + htmlEsc(lastReport) + "</pre>";
 
   h += "<form method='post' action='/settings'><fieldset><legend>Diagnostics</legend>"
@@ -968,6 +974,394 @@ static void handleJson() {
   server.send(200, "application/json", p.s);
 }
 
+// ============================================================ VERSION 3: CONNECTION TEST
+// PlayStation-style step list. Runs in its own task so the web page stays live.
+enum StepState : uint8_t { ST_WAIT = 0, ST_RUN, ST_OK, ST_WARN, ST_FAIL, ST_SKIP };
+static const char *STEP_STATE[] = {"Waiting", "Testing...", "Successful", "Warning", "Failed", "Skipped"};
+static const char *STEP_NAME[] = {"Wi-Fi Connection", "Obtain IP Address", "Router (Gateway)", "DNS",
+                                  "Internet Connection", "Internet Latency", "NAT Type",
+                                  "Download Speed", "Upload Speed"};
+static const int NSTEPS = 9;
+struct Step {
+  StepState st = ST_WAIT;
+  char value[96] = "";
+  char note[200] = "";
+};
+Step steps[NSTEPS];
+volatile bool testRunning = false;
+volatile bool testRequested = false;
+uint32_t testCount = 0;
+SemaphoreHandle_t testMux = nullptr;
+
+static void setStep(int i, StepState s, const String &v, const String &n = "") {
+  if (testMux) xSemaphoreTake(testMux, portMAX_DELAY);
+  steps[i].st = s;
+  strlcpy(steps[i].value, v.c_str(), sizeof(steps[i].value));
+  strlcpy(steps[i].note, n.c_str(), sizeof(steps[i].note));
+  if (testMux) xSemaphoreGive(testMux);
+}
+
+// ---- ping (ESP-IDF ping session)
+struct PingResult {
+  volatile bool done = false;
+  uint32_t sent = 0, recv = 0, minMs = 0xFFFFFFFF, maxMs = 0, sumMs = 0;
+  float loss() const { return sent ? 100.0f * (sent - recv) / sent : 100.0f; }
+  float avg() const { return recv ? (float)sumMs / recv : 0; }
+};
+static void pingOk(esp_ping_handle_t h, void *a) {
+  PingResult *r = (PingResult *)a;
+  uint32_t t = 0;
+  esp_ping_get_profile(h, ESP_PING_PROF_TIMEGAP, &t, sizeof(t));
+  r->recv++;
+  r->sumMs += t;
+  if (t < r->minMs) r->minMs = t;
+  if (t > r->maxMs) r->maxMs = t;
+}
+static void pingTimeout(esp_ping_handle_t, void *) {}
+static void pingEnd(esp_ping_handle_t h, void *a) {
+  PingResult *r = (PingResult *)a;
+  uint32_t tx = 0;
+  esp_ping_get_profile(h, ESP_PING_PROF_REQUEST, &tx, sizeof(tx));
+  r->sent = tx;
+  r->done = true;
+}
+static bool doPing(IPAddress ip, int count, PingResult &r) {
+  esp_ping_config_t pc = ESP_PING_DEFAULT_CONFIG();
+  ip_addr_t t;
+  memset(&t, 0, sizeof(t));
+  if (!ipaddr_aton(ip.toString().c_str(), &t)) return false;
+  pc.target_addr = t;
+  pc.count = count;
+  pc.interval_ms = 200;
+  pc.timeout_ms = 1000;
+  esp_ping_callbacks_t cb;
+  memset(&cb, 0, sizeof(cb));
+  cb.cb_args = &r;
+  cb.on_ping_success = pingOk;
+  cb.on_ping_timeout = pingTimeout;
+  cb.on_ping_end = pingEnd;
+  esp_ping_handle_t h;
+  if (esp_ping_new_session(&pc, &cb, &h) != ESP_OK) return false;
+  esp_ping_start(h);
+  unsigned long t0 = millis();
+  while (!r.done && millis() - t0 < (unsigned long)count * 1300UL + 3000UL) delay(50);
+  esp_ping_stop(h);
+  esp_ping_delete_session(h);
+  return r.done;
+}
+
+// ---- STUN (RFC 5389) to find the public address/port mapping
+struct StunRes {
+  bool ok = false;
+  IPAddress ip;
+  uint16_t port = 0;
+};
+static StunRes stunQuery(WiFiUDP &u, const char *host, uint16_t port) {
+  StunRes r;
+  IPAddress sip;
+  if (!WiFi.hostByName(host, sip)) return r;
+  uint8_t req[20] = {0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42};
+  for (int i = 8; i < 20; i++) req[i] = esp_random() & 0xFF;
+  for (int attempt = 0; attempt < 3 && !r.ok; attempt++) {
+    u.beginPacket(sip, port);
+    u.write(req, 20);
+    u.endPacket();
+    unsigned long t0 = millis();
+    while (millis() - t0 < 1000 && !r.ok) {
+      int n = u.parsePacket();
+      if (n < 20) { delay(10); continue; }
+      uint8_t b[256];
+      int len = u.read(b, sizeof(b));
+      if (len < 20 || memcmp(b + 8, req + 8, 12) != 0) continue;
+      int end = 20 + ((b[2] << 8) | b[3]);
+      if (end > len) end = len;
+      int pos = 20;
+      while (pos + 4 <= end) {
+        uint16_t type = (b[pos] << 8) | b[pos + 1];
+        uint16_t alen = (b[pos + 2] << 8) | b[pos + 3];
+        int v = pos + 4;
+        if (v + alen > end) break;
+        if ((type == 0x0020 || type == 0x0001) && alen >= 8 && b[v + 1] == 0x01) {
+          uint16_t p = (b[v + 2] << 8) | b[v + 3];
+          uint8_t a[4] = {b[v + 4], b[v + 5], b[v + 6], b[v + 7]};
+          if (type == 0x0020) {
+            p ^= 0x2112;
+            a[0] ^= 0x21; a[1] ^= 0x12; a[2] ^= 0xA4; a[3] ^= 0x42;
+          }
+          r.ip = IPAddress(a[0], a[1], a[2], a[3]);
+          r.port = p;
+          r.ok = true;
+          if (type == 0x0020) break;
+        }
+        pos = v + ((alen + 3) & ~3);
+      }
+    }
+  }
+  return r;
+}
+
+// ---- speed tests (Cloudflare speed endpoints). Limited by the ESP32 itself.
+static const char *SPEED_HOST = "speed.cloudflare.com";
+
+static float downloadMbps(String &err) {
+  WiFiClientSecure c;
+  c.setInsecure();  // speed test only; no secrets are sent
+  c.setTimeout(10);
+  if (!c.connect(SPEED_HOST, 443)) { err = "could not reach speed server"; return -1; }
+  c.print("GET /__down?bytes=25000000 HTTP/1.1\r\nHost: speed.cloudflare.com\r\nUser-Agent: NetDiag\r\nConnection: close\r\n\r\n");
+  static uint8_t buf[2048];
+  size_t total = 0;
+  unsigned long start = 0, t0 = millis();
+  while (millis() - t0 < 14000) {
+    int n = c.read(buf, sizeof(buf));
+    if (n > 0) {
+      if (!start) start = millis();
+      total += n;
+      if (millis() - start >= 8000) break;
+    } else if (!c.connected()) break;
+    else delay(1);
+  }
+  unsigned long el = start ? millis() - start : 0;
+  c.stop();
+  if (!start || el < 300) { err = "no data received"; return -1; }
+  return total * 8.0f / el / 1000.0f;
+}
+
+static float uploadMbps(String &err) {
+  WiFiClientSecure c;
+  c.setInsecure();
+  c.setTimeout(10);
+  if (!c.connect(SPEED_HOST, 443)) { err = "could not reach speed server"; return -1; }
+  const size_t N = 8000000;
+  c.printf("POST /__up HTTP/1.1\r\nHost: speed.cloudflare.com\r\nUser-Agent: NetDiag\r\n"
+           "Content-Type: application/octet-stream\r\nContent-Length: %u\r\nConnection: close\r\n\r\n", (unsigned)N);
+  static uint8_t buf[1400];
+  memset(buf, 'x', sizeof(buf));
+  size_t sent = 0;
+  unsigned long start = millis();
+  while (sent < N && millis() - start < 8000) {
+    size_t w = c.write(buf, sizeof(buf));
+    if (w == 0) { if (!c.connected()) break; delay(2); continue; }
+    sent += w;
+  }
+  unsigned long el = millis() - start;
+  c.stop();
+  if (sent < 20000 || el < 300) { err = "upload stalled"; return -1; }
+  return sent * 8.0f / el / 1000.0f;
+}
+
+static const char *signalWord(int rssi) {
+  if (rssi >= -60) return "Excellent";
+  if (rssi >= -67) return "Good";
+  if (rssi >= -75) return "Fair";
+  return "Poor";
+}
+
+static void skipFrom(int i, const char *why) {
+  for (int k = i; k < NSTEPS; k++) setStep(k, ST_SKIP, "", why);
+}
+
+static void runConnectionTest() {
+  for (int i = 0; i < NSTEPS; i++) setStep(i, ST_WAIT, "");
+  while (cycleActive) delay(100);  // let a running Wi-Fi scan finish first
+
+  // 1. Wi-Fi
+  setStep(0, ST_RUN, "");
+  if (WiFi.status() != WL_CONNECTED) {
+    setStep(0, ST_FAIL, cfg.staSsid.length() ? "not connected to " + cfg.staSsid : "no Wi-Fi configured",
+            "Use 'Join my Wi-Fi' on the main page. If it is set, the signal may be too weak or the password wrong.");
+    skipFrom(1, "Needs a Wi-Fi connection");
+    return;
+  }
+  int rssi = WiFi.RSSI();
+  String wv = WiFi.SSID() + fmt(" | ch %d | %d dBm %s", WiFi.channel(), rssi, signalWord(rssi));
+  if (rssi < -75)
+    setStep(0, ST_WARN, wv, "Weak signal causes slow speed and packet loss. Move closer to the router or add an access point.");
+  else
+    setStep(0, ST_OK, wv);
+
+  // 2. IP address (DHCP)
+  setStep(1, ST_RUN, "");
+  IPAddress ip = WiFi.localIP(), gw = WiFi.gatewayIP(), mask = WiFi.subnetMask(), dns1 = WiFi.dnsIP(0), dns2 = WiFi.dnsIP(1);
+  String iv = ip.toString() + " / " + mask.toString() + " | gw " + gw.toString() + " | DNS " + dns1.toString();
+  if (dns2 != IPAddress(0, 0, 0, 0)) iv += ", " + dns2.toString();
+  if (ip[0] == 169 && ip[1] == 254) {
+    setStep(1, ST_FAIL, iv, "Self-assigned address: the DHCP server did not answer. Check the router's DHCP setting.");
+    skipFrom(2, "Needs a valid IP address");
+    return;
+  }
+  bool sameNet = ((uint32_t)ip & (uint32_t)mask) == ((uint32_t)gw & (uint32_t)mask);
+  if (gw == IPAddress(0, 0, 0, 0) || !sameNet)
+    setStep(1, ST_WARN, iv, "Gateway is missing or outside your subnet - DHCP settings look wrong.");
+  else if (dns1 == IPAddress(0, 0, 0, 0))
+    setStep(1, ST_WARN, iv, "No DNS server was given by DHCP.");
+  else
+    setStep(1, ST_OK, iv);
+
+  // 3. Gateway ping
+  setStep(2, ST_RUN, "pinging " + gw.toString());
+  PingResult pg;
+  if (!doPing(gw, 20, pg) || pg.recv == 0) {
+    setStep(2, ST_FAIL, gw.toString() + " no reply",
+            "Router did not answer ping. Some routers block ping; if the next steps pass, this is harmless.");
+  } else {
+    String v = fmt("avg %.0f ms (min %u / max %u) | loss %.0f%%", pg.avg(), pg.minMs, pg.maxMs, pg.loss());
+    if (pg.loss() > 5 || pg.avg() > 50)
+      setStep(2, ST_FAIL, v, "High loss or delay to your own router = Wi-Fi problem (weak signal, interference, or overloaded router).");
+    else if (pg.loss() > 0 || pg.avg() > 15 || pg.maxMs > 100)
+      setStep(2, ST_WARN, v, "Some loss or jitter on the Wi-Fi link. Check signal strength and channel congestion.");
+    else
+      setStep(2, ST_OK, v);
+  }
+
+  // 4. DNS
+  setStep(3, ST_RUN, "resolving google.com");
+  IPAddress res;
+  unsigned long t0 = millis();
+  bool dnsOk = WiFi.hostByName("google.com", res);
+  unsigned long dnsMs = millis() - t0;
+  if (!dnsOk) {
+    setStep(3, ST_FAIL, "google.com could not be resolved",
+            "DNS failed. Check the DNS servers in the router (try 1.1.1.1 / 8.8.8.8) or the internet connection.");
+  } else {
+    String v = fmt("google.com -> %s in %lu ms", res.toString().c_str(), dnsMs);
+    v += (dns1 == gw) ? " (via router)" : " (via " + dns1.toString() + ")";
+    if (dnsMs > 300) setStep(3, ST_WARN, v, "Slow DNS makes every website start slowly. Try 1.1.1.1 or 8.8.8.8 in the router.");
+    else setStep(3, ST_OK, v);
+  }
+
+  // 5. Internet connection (HTTP 204 check)
+  setStep(4, ST_RUN, "");
+  int code = -1;
+  {
+    HTTPClient http;
+    http.setTimeout(6000);
+    if (http.begin("http://connectivitycheck.gstatic.com/generate_204")) {
+      code = http.GET();
+      http.end();
+    }
+  }
+  if (code == 204) setStep(4, ST_OK, "online");
+  else if (code > 0) setStep(4, ST_WARN, fmt("unexpected HTTP %d", code), "A login page or filter is intercepting traffic (captive portal / parental control).");
+  else {
+    setStep(4, ST_FAIL, "no internet", dnsOk ? "Local network works but traffic does not reach the internet. Check the router's WAN / ISP line."
+                                             : "No DNS and no internet. Check the router's WAN / ISP connection.");
+    skipFrom(5, "Needs internet");
+    return;
+  }
+
+  // 6. Internet latency
+  setStep(5, ST_RUN, "pinging 1.1.1.1");
+  PingResult pi;
+  if (!doPing(IPAddress(1, 1, 1, 1), 20, pi) || pi.recv == 0) {
+    setStep(5, ST_WARN, "1.1.1.1 no ping reply", "Ping may be blocked upstream; web traffic works.");
+  } else {
+    String v = fmt("1.1.1.1 avg %.0f ms (min %u / max %u) | loss %.0f%%", pi.avg(), pi.minMs, pi.maxMs, pi.loss());
+    bool lanOk = pg.recv > 0 && pg.loss() == 0;
+    if (pi.loss() > 2 || pi.avg() > 100)
+      setStep(5, ST_WARN, v, lanOk ? "Your Wi-Fi is clean, so the loss/delay is beyond your router (ISP or line)."
+                                   : "Some of this comes from the Wi-Fi link (see Router step).");
+    else
+      setStep(5, ST_OK, v);
+  }
+
+  // 7. NAT type via two STUN servers
+  setStep(6, ST_RUN, "");
+  {
+    WiFiUDP u;
+    u.begin(40000 + (esp_random() % 20000));
+    StunRes a = stunQuery(u, "stun.l.google.com", 19302);
+    StunRes b = stunQuery(u, "stun.cloudflare.com", 3478);
+    u.stop();
+    if (!a.ok && !b.ok) {
+      setStep(6, ST_FAIL, "Failed (UDP blocked)", "No UDP replies. Online games and calls may fail. Check firewall settings.");
+    } else {
+      StunRes &m = a.ok ? a : b;
+      String v = "public IP " + m.ip.toString();
+      if (m.ip == ip) {
+        setStep(6, ST_OK, "Type 1 | " + v, "Directly on the internet, no NAT. Make sure a firewall is on.");
+      } else if (a.ok && b.ok && a.port != b.port) {
+        setStep(6, ST_WARN, "Type 3 (strict) | " + v,
+                "Symmetric NAT: online games/voice chat may fail to connect. Enable UPnP, check for double NAT "
+                "(two routers), or forward ports.");
+      } else if (a.ok && b.ok) {
+        setStep(6, ST_OK, "Type 2 | " + v, "Behind a normal router (good for gaming).");
+      } else {
+        setStep(6, ST_WARN, "Type 2? | " + v, "Only one STUN server answered; result not certain.");
+      }
+    }
+  }
+
+  // 8-9. Speed
+  setStep(7, ST_RUN, "downloading for 8 s");
+  String err;
+  float dl = downloadMbps(err);
+  if (dl < 0) setStep(7, ST_FAIL, err);
+  else setStep(7, dl < 2 ? ST_WARN : ST_OK, fmt("%.1f Mbps", dl),
+               "Max ~10-20 Mbps: limited by the ESP32 and its signal, not your internet plan.");
+  setStep(8, ST_RUN, "uploading for 8 s");
+  err = "";
+  float ul = uploadMbps(err);
+  if (ul < 0) setStep(8, ST_FAIL, err);
+  else setStep(8, ul < 1 ? ST_WARN : ST_OK, fmt("%.1f Mbps", ul), "Also limited by the ESP32.");
+}
+
+static void testTask(void *) {
+  for (;;) {
+    if (testRequested) {
+      testRequested = false;
+      testRunning = true;
+      testCount++;
+      Serial.println("\n> connection test started");
+      runConnectionTest();
+      testRunning = false;
+      Serial.println("\n-- CONNECTION TEST --");
+      for (int i = 0; i < NSTEPS; i++) {
+        Serial.printf("%-20s %-11s %s\n", STEP_NAME[i], STEP_STATE[steps[i].st], steps[i].value);
+        if (steps[i].note[0] && steps[i].st != ST_OK) Serial.printf("   -> %s\n", steps[i].note);
+      }
+    }
+    delay(100);
+  }
+}
+
+static void handleTestPage() {
+  if (!auth()) return;
+  String h;
+  h.reserve(5000);
+  h += F("<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
+  if (testRunning || testRequested) h += F("<meta http-equiv='refresh' content='2'>");
+  h += F("<title>Test Connection</title><style>"
+         "body{font-family:sans-serif;margin:0;background:linear-gradient(#0b2a6b,#061538);color:#fff;min-height:100vh}"
+         "h2{font-weight:300;margin:0;padding:16px}.row{border-top:1px solid #ffffff22;padding:12px 16px}"
+         ".n{font-size:17px}.s{float:right;font-weight:bold}.v{font-size:12px;color:#c8d3f0;margin-top:4px;word-break:break-word}"
+         ".t{font-size:12px;color:#ffd27a;margin-top:4px}.OK{color:#7dffa1}.WARN{color:#ffd27a}.FAIL{color:#ff7d7d}"
+         ".RUN{color:#7dc8ff}.WAIT,.SKIP{color:#8a97b8}button{margin:16px;padding:12px 22px;font-size:16px;border-radius:24px;"
+         "border:0;background:#fff;color:#0b2a6b}a{color:#9fc3ff;margin-left:16px}</style></head><body>");
+  h += F("<h2>Test Internet Connection</h2>");
+  static const char *cls[] = {"WAIT", "RUN", "OK", "WARN", "FAIL", "SKIP"};
+  if (testMux) xSemaphoreTake(testMux, portMAX_DELAY);
+  for (int i = 0; i < NSTEPS; i++) {
+    h += "<div class='row'><span class='n'>" + String(STEP_NAME[i]) + "</span><span class='s " + cls[steps[i].st] + "'>" +
+         STEP_STATE[steps[i].st] + "</span>";
+    if (steps[i].value[0]) h += "<div class='v'>" + htmlEsc(steps[i].value) + "</div>";
+    if (steps[i].note[0] && steps[i].st != ST_OK && steps[i].st != ST_WAIT) h += "<div class='t'>" + htmlEsc(steps[i].note) + "</div>";
+    h += "</div>";
+  }
+  if (testMux) xSemaphoreGive(testMux);
+  if (testRunning || testRequested) h += F("<p style='padding:0 16px'>Testing... about 45 seconds. This page refreshes itself.</p>");
+  else h += F("<form method='post' action='/test'><button>Test Internet Connection</button></form>");
+  h += F("<a href='/'>&larr; Back to Wi-Fi report</a><br><br></body></html>");
+  server.send(200, "text/html", h);
+}
+
+static void handleTestRun() {
+  if (!auth()) return;
+  if (!testRunning) testRequested = true;
+  server.sendHeader("Location", "/test");
+  server.send(303);
+}
+
 static void startWeb() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/scan", HTTP_POST, handleScan);
@@ -976,6 +1370,8 @@ static void startWeb() {
   server.on("/password", HTTP_POST, handlePassword);
   server.on("/reset", HTTP_POST, handleReset);
   server.on("/api/report", HTTP_GET, handleJson);
+  server.on("/test", HTTP_GET, handleTestPage);
+  server.on("/test", HTTP_POST, handleTestRun);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
   server.begin();
 }
@@ -995,6 +1391,7 @@ static void printHelp() {
   Serial.println("  wifi -             forget your Wi-Fi");
   Serial.println("  pass NEWPASSWORD   set hotspot + web password (8+ chars)");
   Serial.println("  reset              clear persistence history");
+  Serial.println("  test               run the internet connection test");
   Serial.println("  status             show settings");
 }
 
@@ -1035,6 +1432,7 @@ static void handleCommand(String line) {
   } else if (cmd == "raw") { cfg.raw = (arg == "on"); saveSettings(); Serial.printf("> raw %s\n", cfg.raw ? "on" : "off"); }
   else if (cmd == "json") { cfg.json = (arg == "on"); saveSettings(); Serial.printf("> json %s\n", cfg.json ? "on" : "off"); }
   else if (cmd == "reset") { history.clear(); lastChannel.clear(); cycleNo = 0; Serial.println("> history cleared"); }
+  else if (cmd == "test") { if (!testRunning) testRequested = true; Serial.println("> connection test queued"); }
   else if (cmd == "pass") {
     if (arg.length() < 8 || arg.length() > 63 || arg.indexOf(' ') >= 0) {
       Serial.println("> use: pass NEWPASSWORD  (8-63 characters, no spaces)");
@@ -1133,6 +1531,8 @@ void setup() {
   apName = fmt("NetDiag-%02X%02X", mac[4], mac[5]);
   WiFi.softAP(apName.c_str(), cfg.adminPass.c_str());
   startStation();
+  testMux = xSemaphoreCreateMutex();
+  xTaskCreatePinnedToCore(testTask, "nettest", 16384, nullptr, 1, nullptr, 1);
   startWeb();
   if (MDNS.begin("netdiag")) MDNS.addService("http", "tcp", 80);
 
@@ -1154,6 +1554,8 @@ void loop() {
 
   if (cycleActive) {
     stepCycle();
+  } else if (testRunning || testRequested) {
+    // pause Wi-Fi scans while the connection test runs
   } else if (scanRequested || millis() - lastCycle >= (unsigned long)cfg.intervalS * 1000UL) {
     scanRequested = false;
     stepCycle();
