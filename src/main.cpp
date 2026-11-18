@@ -1379,6 +1379,7 @@ static void runFixJob();
 static void runRouterIdentify();
 static void runRouterVerify();
 static void lanScan();
+static void pollSerial();
 
 static void testTask(void *) {
   for (;;) {
