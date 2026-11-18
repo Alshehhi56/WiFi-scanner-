@@ -49,8 +49,15 @@
 #include <HTTPClient.h>
 #include "ping/ping_sock.h"
 #include "lwip/ip_addr.h"
+#include <Update.h>
+#include <esp_ota_ops.h>
+#include <esp_partition.h>
+#include <esp_https_ota.h>
+#include <esp_http_client.h>
+#include <esp_crt_bundle.h>
+#include <mbedtls/sha256.h>
 
-#define FW_VERSION "3.0.0"
+#define FW_VERSION "3.1.0"
 #define DEFAULT_PASS "netdiag123"  // public default; change it with: pass NEWPASSWORD
 
 static const int MAX_CH = 13;    // channels 1..13 allowed in the UAE
@@ -888,7 +895,7 @@ static void handleRoot() {
   else
     h += "Home LAN: not connected";
   h += "</p><form method='post' action='/scan'><button>Scan now</button> <a href='/'>Refresh</a> | <a href='/api/report'>JSON</a></form>";
-  h += "<p><a href='/test' style='display:inline-block;padding:12px 18px;background:#0b2a6b;color:#fff;border-radius:22px;text-decoration:none'>Test Internet Connection &rarr;</a></p>";
+  h += "<p><a href='/test' style='display:inline-block;padding:12px 18px;background:#0b2a6b;color:#fff;border-radius:22px;text-decoration:none'>Test Internet Connection &rarr;</a> &nbsp; <a href='/update'>Firmware &amp; system</a></p>";
   h += "<pre>" + htmlEsc(lastReport) + "</pre>";
 
   h += "<form method='post' action='/settings'><fieldset><legend>Diagnostics</legend>"
@@ -1362,6 +1369,390 @@ static void handleTestRun() {
   server.send(303);
 }
 
+// ============================================================ OTA FIRMWARE UPDATES (v3.1)
+// Two ways to update without USB:
+//   1. GitHub: device downloads the newest release published by GitHub Actions,
+//      over HTTPS with certificate checking, and verifies size + SHA-256
+//      against manifest.json before switching to it.
+//   2. Upload: send firmware.bin from the phone's browser (needs your own password).
+// Safety: two app slots. New firmware must run 90 s healthy; if it reboots 3 times
+// first, the device switches back to the previous slot. Manual rollback button too.
+static const char *OTA_MANIFEST_URL =
+    "https://github.com/Alshehhi56/WiFi-scanner-/releases/latest/download/manifest.json";
+static const unsigned long OTA_HEALTHY_MS = 90000;
+
+extern "C" bool verifyRollbackLater() { return true; }  // we confirm the image ourselves
+
+SemaphoreHandle_t otaMux = nullptr;
+String otaStatus = "Idle";
+int otaProgress = -1;  // 0-100 while installing
+volatile bool otaCheckReq = false, otaInstallReq = false, otaBusy = false;
+String otaLatestVer, otaLatestUrl, otaLatestSha;
+uint32_t otaLatestSize = 0;
+bool otaHealthyDone = false;
+bool uploadDenied = false;
+String uploadErr;
+
+static void setOta(const String &s, int prog = -1) {
+  if (otaMux) xSemaphoreTake(otaMux, portMAX_DELAY);
+  otaStatus = s;
+  otaProgress = prog;
+  if (otaMux) xSemaphoreGive(otaMux);
+  Serial.printf("> OTA: %s\n", s.c_str());
+}
+static String getOta(int *prog = nullptr) {
+  if (otaMux) xSemaphoreTake(otaMux, portMAX_DELAY);
+  String s = otaStatus;
+  if (prog) *prog = otaProgress;
+  if (otaMux) xSemaphoreGive(otaMux);
+  return s;
+}
+
+static long verNum(const String &v) {
+  int a = 0, b = 0, c = 0;
+  sscanf(v.c_str(), "%d.%d.%d", &a, &b, &c);
+  return a * 1000000L + b * 1000L + c;
+}
+
+static String jsonField(const String &body, const char *key) {
+  String k = String("\"") + key + "\"";
+  int i = body.indexOf(k);
+  if (i < 0) return "";
+  i = body.indexOf(':', i + k.length());
+  if (i < 0) return "";
+  i++;
+  while (i < (int)body.length() && body[i] == ' ') i++;
+  if (i < (int)body.length() && body[i] == '"') {
+    int e = body.indexOf('"', i + 1);
+    return e < 0 ? String("") : body.substring(i + 1, e);
+  }
+  int e = i;
+  while (e < (int)body.length() && body[e] != ',' && body[e] != '}' && body[e] != ' ') e++;
+  return body.substring(i, e);
+}
+
+static esp_err_t manifestEvt(esp_http_client_event_t *e) {
+  String *s = (String *)e->user_data;
+  if (!s) return ESP_OK;
+  if (e->event_id == HTTP_EVENT_ON_CONNECTED) *s = "";
+  if (e->event_id == HTTP_EVENT_ON_DATA && s->length() < 4096)
+    for (int i = 0; i < e->data_len; i++) *s += ((const char *)e->data)[i];
+  return ESP_OK;
+}
+
+static bool otaCheck() {
+  if (WiFi.status() != WL_CONNECTED) { setOta("Not connected to your Wi-Fi - join it first"); return false; }
+  setOta("Checking GitHub for new firmware...");
+  String body;
+  esp_http_client_config_t c;
+  memset(&c, 0, sizeof(c));
+  c.url = OTA_MANIFEST_URL;
+  c.crt_bundle_attach = esp_crt_bundle_attach;  // real certificate check
+  c.event_handler = manifestEvt;
+  c.user_data = &body;
+  c.timeout_ms = 15000;
+  c.max_redirection_count = 6;
+  c.buffer_size = 4096;
+  c.buffer_size_tx = 4096;
+  esp_http_client_handle_t h = esp_http_client_init(&c);
+  if (!h) { setOta("Check failed: HTTP client init"); return false; }
+  esp_err_t r = esp_http_client_perform(h);
+  int st = esp_http_client_get_status_code(h);
+  esp_http_client_cleanup(h);
+  if (r != ESP_OK) { setOta(String("Check failed: ") + esp_err_to_name(r)); return false; }
+  if (st != 200) { setOta(fmt("Check failed: HTTP %d (no release published yet?)", st)); return false; }
+  otaLatestVer = jsonField(body, "version");
+  otaLatestUrl = jsonField(body, "url");
+  otaLatestSha = jsonField(body, "sha256");
+  otaLatestSha.toLowerCase();
+  otaLatestSize = jsonField(body, "size").toInt();
+  if (!otaLatestVer.length() || !otaLatestUrl.startsWith("https://") || otaLatestSha.length() != 64 || !otaLatestSize) {
+    setOta("Check failed: manifest incomplete");
+    return false;
+  }
+  if (verNum(otaLatestVer) > verNum(FW_VERSION))
+    setOta("Update available: v" + otaLatestVer + fmt(" (%u KB)", otaLatestSize / 1024));
+  else
+    setOta("Up to date (latest is v" + otaLatestVer + ")");
+  return true;
+}
+
+static void markPendingAndRestart(const String &newVer) {
+  const esp_partition_t *run = esp_ota_get_running_partition();
+  prefs.putString("otaprev", run ? run->label : "");
+  prefs.putString("otaprevver", FW_VERSION);
+  prefs.putString("otanewver", newVer);
+  prefs.putBool("otapend", true);
+  prefs.putUChar("otatries", 0);
+  setOta("Installed v" + newVer + " - restarting...");
+  delay(1500);
+  ESP.restart();
+}
+
+static bool sha256Partition(const esp_partition_t *p, uint32_t len, String &hex) {
+  static uint8_t buf[1024];
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts(&ctx, 0);
+  for (uint32_t off = 0; off < len; off += sizeof(buf)) {
+    uint32_t n = std::min<uint32_t>(sizeof(buf), len - off);
+    if (esp_partition_read(p, off, buf, n) != ESP_OK) { mbedtls_sha256_free(&ctx); return false; }
+    mbedtls_sha256_update(&ctx, buf, n);
+  }
+  uint8_t out[32];
+  mbedtls_sha256_finish(&ctx, out);
+  mbedtls_sha256_free(&ctx);
+  hex = "";
+  for (int i = 0; i < 32; i++) hex += fmt("%02x", out[i]);
+  return true;
+}
+
+static void otaInstall() {
+  if (!otaCheck()) return;
+  if (verNum(otaLatestVer) <= verNum(FW_VERSION)) return;
+  while (cycleActive || testRunning) delay(100);
+  setOta("Downloading v" + otaLatestVer + "...", 0);
+  esp_http_client_config_t hc;
+  memset(&hc, 0, sizeof(hc));
+  hc.url = otaLatestUrl.c_str();
+  hc.crt_bundle_attach = esp_crt_bundle_attach;
+  hc.timeout_ms = 20000;
+  hc.max_redirection_count = 6;
+  hc.buffer_size = 4096;
+  hc.buffer_size_tx = 4096;
+  hc.keep_alive_enable = true;
+  esp_https_ota_config_t oc;
+  memset(&oc, 0, sizeof(oc));
+  oc.http_config = &hc;
+  esp_https_ota_handle_t h = nullptr;
+  esp_err_t r = esp_https_ota_begin(&oc, &h);
+  if (r != ESP_OK) { setOta(String("Download failed to start: ") + esp_err_to_name(r)); return; }
+  while ((r = esp_https_ota_perform(h)) == ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
+    int got = esp_https_ota_get_image_len_read(h);
+    int pct = otaLatestSize ? (int)(100.0f * got / otaLatestSize) : 0;
+    static int lastPct = -1;
+    if (pct / 10 != lastPct / 10) { lastPct = pct; setOta("Downloading v" + otaLatestVer + fmt("... %d%%", pct), pct); }
+  }
+  if (r != ESP_OK || !esp_https_ota_is_complete_data_received(h)) {
+    esp_https_ota_abort(h);
+    setOta(String("Download failed: ") + esp_err_to_name(r) + " - still on v" FW_VERSION);
+    return;
+  }
+  uint32_t len = esp_https_ota_get_image_len_read(h);
+  if (len != otaLatestSize) {
+    esp_https_ota_abort(h);
+    setOta(fmt("Rejected: size %u, expected %u - still on v" FW_VERSION, len, otaLatestSize));
+    return;
+  }
+  setOta("Verifying SHA-256...", 100);
+  String hex;
+  const esp_partition_t *dst = esp_ota_get_next_update_partition(NULL);
+  if (!dst || !sha256Partition(dst, len, hex) || hex != otaLatestSha) {
+    esp_https_ota_abort(h);
+    setOta("Rejected: SHA-256 mismatch - still on v" FW_VERSION);
+    return;
+  }
+  r = esp_https_ota_finish(h);  // validates the image and selects it for next boot
+  if (r != ESP_OK) { setOta(String("Rejected by image check: ") + esp_err_to_name(r)); return; }
+  markPendingAndRestart(otaLatestVer);
+}
+
+static void otaTask(void *) {
+  for (;;) {
+    if (otaCheckReq || otaInstallReq) {
+      bool inst = otaInstallReq;
+      otaCheckReq = otaInstallReq = false;
+      otaBusy = true;
+      if (inst) otaInstall();
+      else otaCheck();
+      otaBusy = false;
+    }
+    delay(200);
+  }
+}
+
+// Called early in setup(): count boots of a freshly installed image; roll back after 3 failures.
+static void otaBootCheck() {
+  String msg = prefs.getString("otamsg", "");
+  if (msg.length()) setOta(msg);
+  if (!prefs.getBool("otapend", false)) return;
+  uint8_t t = prefs.getUChar("otatries", 0) + 1;
+  prefs.putUChar("otatries", t);
+  Serial.printf("> new firmware v%s, boot attempt %u/3\n", FW_VERSION, t);
+  if (t <= 3) return;
+  String prev = prefs.getString("otaprev", "");
+  const esp_partition_t *p = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, prev.c_str());
+  prefs.putBool("otapend", false);
+  if (p && esp_ota_set_boot_partition(p) == ESP_OK) {
+    prefs.putString("otamsg", "Rolled back to v" + prefs.getString("otaprevver", "?") + ": new firmware failed to start 3 times");
+    Serial.println("> rolling back to previous firmware");
+    delay(500);
+    ESP.restart();
+  }
+}
+
+// Called from loop(): after 90 s of normal running, accept the new image.
+static void otaHealthTick() {
+  if (otaHealthyDone || millis() < OTA_HEALTHY_MS) return;
+  otaHealthyDone = true;
+  esp_ota_mark_app_valid_cancel_rollback();
+  if (prefs.getBool("otapend", false)) {
+    prefs.putBool("otapend", false);
+    prefs.putUChar("otatries", 0);
+    String m = "Updated to v" FW_VERSION " (previous v" + prefs.getString("otaprevver", "?") + " kept for rollback)";
+    prefs.putString("otamsg", m);
+    setOta(m);
+  }
+}
+
+static bool canRollback(String &info) {
+  const esp_partition_t *other = esp_ota_get_next_update_partition(NULL);
+  String prev = prefs.getString("otaprev", "");
+  esp_app_desc_t d;
+  if (!other || prev != other->label || esp_ota_get_partition_description(other, &d) != ESP_OK) {
+    info = "No previous firmware recorded";
+    return false;
+  }
+  info = String("v") + prefs.getString("otaprevver", "?") + " in slot " + other->label;
+  return true;
+}
+
+// ---- web: /update
+static void handleUpdatePage() {
+  if (!auth()) return;
+  int prog = -1;
+  String st = getOta(&prog);
+  const esp_partition_t *run = esp_ota_get_running_partition();
+  String rbInfo;
+  bool rb = canRollback(rbInfo);
+  String h;
+  h.reserve(5000);
+  h += F("<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
+  if (otaBusy || otaCheckReq || otaInstallReq) h += F("<meta http-equiv='refresh' content='3'>");
+  h += F("<title>Firmware</title><style>body{font-family:sans-serif;margin:8px;background:#f4f4f4}"
+         "fieldset{background:#fff;border:1px solid #ccc;border-radius:6px;margin:8px 0}td{padding:2px 6px;font-size:13px}"
+         "button{padding:10px 14px;margin:4px 0}.s{background:#e8f0ff;padding:8px;border-radius:4px}"
+         ".w{background:#fff3cd;padding:8px;border-radius:4px}</style></head><body>");
+  h += "<h3>Firmware &amp; System</h3><p class='s'><b>Status:</b> " + htmlEsc(st);
+  if (prog >= 0) h += fmt(" <progress max='100' value='%d'></progress>", prog);
+  h += "</p>";
+
+  h += "<form method='post' action='/ota'><fieldset><legend>Update from GitHub</legend>"
+       "Running <b>v" FW_VERSION "</b>. Downloads the newest release from your repository over HTTPS, "
+       "checks size and SHA-256, then restarts.<br>"
+       "<button name='a' value='check'>Check for update</button> "
+       "<button name='a' value='install'>Install update</button></fieldset></form>";
+
+  if (!cfg.customPass)
+    h += "<p class='w'>Upload and rollback are locked while the default password is in use. "
+         "Set your own password on the main page first.</p>";
+  h += "<form method='post' action='/update' enctype='multipart/form-data'><fieldset><legend>Upload firmware file</legend>"
+       "Choose <b>firmware.bin</b> (not merged-firmware.bin).<br><input type='file' name='fw' accept='.bin'><br>"
+       "<button>Upload &amp; install</button></fieldset></form>";
+  h += "<form method='post' action='/rollback'><fieldset><legend>Roll back</legend>" + htmlEsc(rbInfo) + "<br>";
+  if (rb) h += "<label><input type='checkbox' name='yes' value='1'> I want to go back</label><br><button>Roll back &amp; restart</button>";
+  h += "</fieldset></form>";
+
+  h += "<fieldset><legend>System</legend><table>";
+  h += "<tr><td>Firmware</td><td>v" FW_VERSION " built " __DATE__ " " __TIME__ "</td></tr>";
+  h += fmt("<tr><td>Chip</td><td>%s rev %d, %d cores, %lu MHz</td></tr>", ESP.getChipModel(), ESP.getChipRevision(),
+           ESP.getChipCores(), (unsigned long)ESP.getCpuFreqMHz());
+  h += fmt("<tr><td>Flash</td><td>%lu MB</td></tr>", (unsigned long)(ESP.getFlashChipSize() >> 20));
+  h += fmt("<tr><td>PSRAM</td><td>%lu KB %s</td></tr>", (unsigned long)(ESP.getPsramSize() >> 10),
+           ESP.getPsramSize() ? "" : "(not enabled in build)");
+  h += fmt("<tr><td>Free heap</td><td>%lu KB (min %lu KB)</td></tr>", (unsigned long)(ESP.getFreeHeap() >> 10),
+           (unsigned long)(ESP.getMinFreeHeap() >> 10));
+  h += fmt("<tr><td>App size</td><td>%lu KB of %lu KB slot</td></tr>", (unsigned long)(ESP.getSketchSize() >> 10),
+           (unsigned long)((ESP.getSketchSize() + ESP.getFreeSketchSpace()) >> 10));
+  h += String("<tr><td>Running slot</td><td>") + (run ? run->label : "?") + "</td></tr>";
+  h += fmt("<tr><td>Uptime</td><td>%lu s</td></tr>", millis() / 1000);
+  h += "</table><br><b>Partitions</b><table>";
+  esp_partition_iterator_t it = esp_partition_find(ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, NULL);
+  while (it) {
+    const esp_partition_t *p = esp_partition_get(it);
+    h += fmt("<tr><td>%s</td><td>0x%06lx</td><td>%lu KB</td></tr>", p->label, (unsigned long)p->address,
+             (unsigned long)(p->size >> 10));
+    it = esp_partition_next(it);
+  }
+  esp_partition_iterator_release(it);
+  h += "</table></fieldset><a href='/'>&larr; Back</a></body></html>";
+  server.send(200, "text/html", h);
+}
+
+static void handleOtaAction() {
+  if (!auth()) return;
+  String a = server.arg("a");
+  if (otaBusy) { server.sendHeader("Location", "/update"); server.send(303); return; }
+  if (a == "install") otaInstallReq = true;
+  else otaCheckReq = true;
+  server.sendHeader("Location", "/update");
+  server.send(303);
+}
+
+static void handleUploadData() {
+  HTTPUpload &up = server.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    uploadDenied = !server.authenticate("admin", cfg.adminPass.c_str()) || !cfg.customPass || otaBusy;
+    uploadErr = "";
+    if (uploadDenied) return;
+    if (up.filename.indexOf("merged") >= 0) { uploadErr = "Use firmware.bin, not merged-firmware.bin"; return; }
+    otaBusy = true;
+    setOta("Receiving " + up.filename + "...");
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) uploadErr = String("Update.begin: ") + Update.errorString();
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (uploadDenied || uploadErr.length()) return;
+    if (Update.write(up.buf, up.currentSize) != up.currentSize) uploadErr = String("write: ") + Update.errorString();
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (uploadDenied || uploadErr.length()) { Update.abort(); return; }
+    if (!Update.end(true)) uploadErr = String("verify: ") + Update.errorString();  // checks image + its SHA-256
+  } else if (up.status == UPLOAD_FILE_ABORTED) {
+    Update.abort();
+    uploadErr = "upload aborted";
+  }
+}
+
+static void handleUploadDone() {
+  if (!auth()) return;
+  if (uploadDenied) {
+    server.send(403, "text/plain", cfg.customPass ? "Busy, try again" : "Set your own password first (main page).");
+    return;
+  }
+  if (uploadErr.length()) {
+    otaBusy = false;
+    setOta("Upload rejected: " + uploadErr + " - still on v" FW_VERSION);
+    server.sendHeader("Location", "/update");
+    server.send(303);
+    return;
+  }
+  server.send(200, "text/html", "<meta http-equiv='refresh' content='25;url=/update'>Installed. Restarting... page reloads in 25 s.");
+  delay(300);
+  markPendingAndRestart("uploaded");
+}
+
+static void handleRollback() {
+  if (!auth()) return;
+  String info;
+  if (!cfg.customPass) { server.send(403, "text/plain", "Set your own password first (main page)."); return; }
+  if (server.arg("yes") != "1" || !canRollback(info)) { server.sendHeader("Location", "/update"); server.send(303); return; }
+  const esp_partition_t *other = esp_ota_get_next_update_partition(NULL);
+  if (esp_ota_set_boot_partition(other) != ESP_OK) { setOta("Rollback failed: image not valid"); server.sendHeader("Location", "/update"); server.send(303); return; }
+  prefs.putBool("otapend", false);
+  prefs.putString("otamsg", "Rolled back by you from v" FW_VERSION);
+  server.send(200, "text/html", "<meta http-equiv='refresh' content='25;url=/update'>Rolling back. Restarting...");
+  delay(500);
+  ESP.restart();
+}
+
+static void handleInfo() {
+  if (!auth()) return;
+  const esp_partition_t *run = esp_ota_get_running_partition();
+  String j = "{\"fw\":\"" FW_VERSION "\",\"slot\":\"" + String(run ? run->label : "?") + "\"";
+  j += fmt(",\"uptime_s\":%lu,\"heap\":%lu,\"rssi\":%d", millis() / 1000, (unsigned long)ESP.getFreeHeap(),
+           WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0);
+  j += ",\"ip\":\"" + WiFi.localIP().toString() + "\",\"ota\":\"" + jsonEsc(getOta()) + "\"}";
+  server.send(200, "application/json", j);
+}
+
 static void startWeb() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/scan", HTTP_POST, handleScan);
@@ -1372,6 +1763,11 @@ static void startWeb() {
   server.on("/api/report", HTTP_GET, handleJson);
   server.on("/test", HTTP_GET, handleTestPage);
   server.on("/test", HTTP_POST, handleTestRun);
+  server.on("/update", HTTP_GET, handleUpdatePage);
+  server.on("/update", HTTP_POST, handleUploadDone, handleUploadData);
+  server.on("/ota", HTTP_POST, handleOtaAction);
+  server.on("/rollback", HTTP_POST, handleRollback);
+  server.on("/api/info", HTTP_GET, handleInfo);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
   server.begin();
 }
@@ -1392,6 +1788,8 @@ static void printHelp() {
   Serial.println("  pass NEWPASSWORD   set hotspot + web password (8+ chars)");
   Serial.println("  reset              clear persistence history");
   Serial.println("  test               run the internet connection test");
+  Serial.println("  ota                check GitHub for new firmware");
+  Serial.println("  ota install        download and install it");
   Serial.println("  status             show settings");
 }
 
@@ -1432,6 +1830,7 @@ static void handleCommand(String line) {
   } else if (cmd == "raw") { cfg.raw = (arg == "on"); saveSettings(); Serial.printf("> raw %s\n", cfg.raw ? "on" : "off"); }
   else if (cmd == "json") { cfg.json = (arg == "on"); saveSettings(); Serial.printf("> json %s\n", cfg.json ? "on" : "off"); }
   else if (cmd == "reset") { history.clear(); lastChannel.clear(); cycleNo = 0; Serial.println("> history cleared"); }
+  else if (cmd == "ota") { if (arg == "install") otaInstallReq = true; else otaCheckReq = true; }
   else if (cmd == "test") { if (!testRunning) testRequested = true; Serial.println("> connection test queued"); }
   else if (cmd == "pass") {
     if (arg.length() < 8 || arg.length() > 63 || arg.indexOf(' ') >= 0) {
@@ -1532,6 +1931,9 @@ void setup() {
   WiFi.softAP(apName.c_str(), cfg.adminPass.c_str());
   startStation();
   testMux = xSemaphoreCreateMutex();
+  otaMux = xSemaphoreCreateMutex();
+  otaBootCheck();
+  xTaskCreatePinnedToCore(otaTask, "ota", 12288, nullptr, 1, nullptr, 1);
   xTaskCreatePinnedToCore(testTask, "nettest", 16384, nullptr, 1, nullptr, 1);
   startWeb();
   if (MDNS.begin("netdiag")) MDNS.addService("http", "tcp", 80);
@@ -1544,6 +1946,7 @@ void setup() {
 void loop() {
   server.handleClient();
   pollSerial();
+  otaHealthTick();
 
   bool up = WiFi.status() == WL_CONNECTED;
   if (up != staWasConnected) {
@@ -1554,7 +1957,7 @@ void loop() {
 
   if (cycleActive) {
     stepCycle();
-  } else if (testRunning || testRequested) {
+  } else if (testRunning || testRequested || otaBusy) {
     // pause Wi-Fi scans while the connection test runs
   } else if (scanRequested || millis() - lastCycle >= (unsigned long)cfg.intervalS * 1000UL) {
     scanRequested = false;
