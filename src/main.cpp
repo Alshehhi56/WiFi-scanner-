@@ -59,7 +59,7 @@
 #include <esp_crt_bundle.h>
 #include <mbedtls/sha256.h>
 
-#define FW_VERSION "3.5.1"
+#define FW_VERSION "3.6.0"
 #define DEFAULT_PASS "netdiag123"  // public default; change it with: pass NEWPASSWORD
 
 static const int MAX_CH = 13;    // channels 1..13 allowed in the UAE
@@ -2337,6 +2337,68 @@ static void handleRouterPage() {
   server.send(200, "text/html", h);
 }
 
+
+// Capture a router page's raw code (for building a model adapter). Reads the
+// user's OWN router with the saved login. Shows status, key headers and body.
+static String gwCapture(const String &path, int &code, String &hdr) {
+  WiFiClient wc;
+  HTTPClient http;
+  String url = "http://" + WiFi.gatewayIP().toString() + path;
+  code = -1;
+  hdr = "";
+  if (!http.begin(wc, url)) return "";
+  http.setTimeout(9000);
+  http.setConnectTimeout(6000);
+  const char *hs[] = {"Server", "Set-Cookie", "WWW-Authenticate", "Location", "Content-Type"};
+  http.collectHeaders(hs, 5);
+  String u = prefs.getString("ruser", ""), pw = prefs.getString("rpass", "");
+  if (u.length()) http.setAuthorization(u.c_str(), pw.c_str());
+  code = http.GET();
+  String body;
+  if (code > 0) {
+    for (int i = 0; i < 5; i++)
+      if (http.header(hs[i]).length()) hdr += String(hs[i]) + ": " + http.header(hs[i]) + "\n";
+    WiFiClient *st = http.getStreamPtr();
+    unsigned long t0 = millis();
+    while (body.length() < 14000 && millis() - t0 < 7000) {
+      if (st->available()) body += (char)st->read();
+      else if (!st->connected()) break;
+      else delay(2);
+    }
+  }
+  http.end();
+  return body;
+}
+
+static void handleRouterCapture() {
+  if (!auth()) return;
+  String path = server.arg("path");
+  path.trim();
+  if (!path.length()) path = "/login.html";
+  if (path[0] != '/') path = "/" + path;
+  String h;
+  h.reserve(16000);
+  h += F("<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Capture</title>");
+  h += FIX_CSS;
+  h += "<style>textarea{width:95%;height:40vh;font-family:monospace;font-size:11px}</style></head><body>";
+  h += "<h2>Router page capture</h2>";
+  h += "<form method='get' action='/router/capture' style='padding:0 16px'>Path on 192.168.1.1:<br>"
+       "<input name='path' value='" + htmlEsc(path) + "' style='width:70%;padding:6px'> <button class='go'>Fetch</button></form>";
+  if (WiFi.status() != WL_CONNECTED) { h += "<p class='c'>Connect the board to your Wi-Fi first.</p>"; }
+  else {
+    int code = -1;
+    String hdr;
+    String body = gwCapture(path, code, hdr);
+    h += "<div class='c'>HTTP status: <b>" + String(code) + "</b><br><pre style='white-space:pre-wrap'>" + htmlEsc(hdr) + "</pre></div>";
+    h += "<p style='padding:0 16px'>Select all and copy this to Claude:</p>";
+    h += "<div style='padding:0 16px'><textarea readonly>" + htmlEsc(body) + "</textarea></div>";
+    h += "<p style='padding:8px 16px;font-size:12px;color:#c8d3f0'>" + String(body.length()) +
+         " bytes shown (truncated at ~14 KB). Useful paths: /login.html, then the Wi-Fi settings page once logged in.</p>";
+  }
+  h += "<p style='padding:0 16px'><a href='/router'>&larr; Router access</a></p></body></html>";
+  server.send(200, "text/html", h);
+}
+
 static void handleRouterCreds() {
   if (!auth()) return;
   if (!cfg.customPass) { server.send(403, "text/plain", "Set your own NetDiag password first (main page)."); return; }
@@ -2524,6 +2586,7 @@ static void startWeb() {
   server.on("/fix", HTTP_GET, handleFixProgress);
   server.on("/router", HTTP_GET, handleRouterPage);
   server.on("/router/creds", HTTP_POST, handleRouterCreds);
+  server.on("/router/capture", HTTP_GET, handleRouterCapture);
   server.on("/devices", HTTP_GET, handleDevicesPage);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
   server.begin();
