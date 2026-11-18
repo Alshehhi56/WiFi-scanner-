@@ -51,6 +51,7 @@
 #include "lwip/ip_addr.h"
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
+#include "lwip/dhcp.h"
 #include <Update.h>
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
@@ -59,7 +60,7 @@
 #include <esp_crt_bundle.h>
 #include <mbedtls/sha256.h>
 
-#define FW_VERSION "3.7.0"
+#define FW_VERSION "3.8.0"
 #define DEFAULT_PASS "netdiag123"  // public default; change it with: pass NEWPASSWORD
 
 static const int MAX_CH = 13;    // channels 1..13 allowed in the UAE
@@ -1229,6 +1230,16 @@ static void skipFrom(int i, const char *why) {
   for (int k = i; k < NSTEPS; k++) setStep(k, ST_SKIP, "", why);
 }
 
+
+// The DHCP server that handed out the current lease (0.0.0.0 if unknown).
+static IPAddress dhcpServerIp() {
+  struct netif *nif = netif_default;
+  if (!nif) return IPAddress(0, 0, 0, 0);
+  struct dhcp *d = netif_dhcp_data(nif);
+  if (!d) return IPAddress(0, 0, 0, 0);
+  return IPAddress(ip4_addr_get_u32(ip_2_ip4(&d->server_ip_addr)));
+}
+
 static void runConnectionTest() {
   for (int i = 0; i < NSTEPS; i++) setStep(i, ST_WAIT, "");
   while (cycleActive) delay(100);  // let a running Wi-Fi scan finish first
@@ -1251,16 +1262,24 @@ static void runConnectionTest() {
   // 2. IP address (DHCP)
   setStep(1, ST_RUN, "");
   IPAddress ip = WiFi.localIP(), gw = WiFi.gatewayIP(), mask = WiFi.subnetMask(), dns1 = WiFi.dnsIP(0), dns2 = WiFi.dnsIP(1);
+  IPAddress dhcp = dhcpServerIp();
   String iv = ip.toString() + " / " + mask.toString() + " | gw " + gw.toString() + " | DNS " + dns1.toString();
   if (dns2 != IPAddress(0, 0, 0, 0)) iv += ", " + dns2.toString();
+  if (dhcp != IPAddress(0, 0, 0, 0)) iv += " | DHCP by " + dhcp.toString();
   if (ip[0] == 169 && ip[1] == 254) {
     setStep(1, ST_FAIL, iv, "Self-assigned address: the DHCP server did not answer. Check the router's DHCP setting.");
     skipFrom(2, "Needs a valid IP address");
     return;
   }
   bool sameNet = ((uint32_t)ip & (uint32_t)mask) == ((uint32_t)gw & (uint32_t)mask);
+  // Rogue-DHCP clue: the server that leased us differs from the gateway it told us to use.
+  bool rogue = dhcp != IPAddress(0, 0, 0, 0) && gw != IPAddress(0, 0, 0, 0) && dhcp != gw;
   if (gw == IPAddress(0, 0, 0, 0) || !sameNet)
     setStep(1, ST_WARN, iv, "Gateway is missing or outside your subnet - DHCP settings look wrong.");
+  else if (rogue)
+    setStep(1, ST_WARN, iv, "The DHCP server (" + dhcp.toString() + ") and the gateway (" + gw.toString() +
+            ") are different devices. If the gateway can't route (e.g. it's a camera), this lease breaks the internet. "
+            "Likely a SECOND DHCP server - turn DHCP off on every device except your main router.");
   else if (dns1 == IPAddress(0, 0, 0, 0))
     setStep(1, ST_WARN, iv, "No DNS server was given by DHCP.");
   else
