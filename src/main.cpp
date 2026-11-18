@@ -59,7 +59,7 @@
 #include <esp_crt_bundle.h>
 #include <mbedtls/sha256.h>
 
-#define FW_VERSION "3.5.0"
+#define FW_VERSION "3.5.1"
 #define DEFAULT_PASS "netdiag123"  // public default; change it with: pass NEWPASSWORD
 
 static const int MAX_CH = 13;    // channels 1..13 allowed in the UAE
@@ -2360,7 +2360,7 @@ struct Dev {
   uint16_t ports = 0;  // bitmask of PORT_LIST indices
   String kind;
 };
-static const uint16_t PORT_LIST[] = {80, 443, 8080, 9100, 631, 515, 22, 445, 554, 53};
+static const uint16_t PORT_LIST[] = {80, 443, 9100, 631, 515, 22, 445, 53};
 static const int NPORTS = sizeof(PORT_LIST) / sizeof(PORT_LIST[0]);
 std::vector<Dev> devices;
 uint32_t lanScanCount = 0;
@@ -2403,14 +2403,13 @@ static String portName(int idx) {
 }
 
 static String classify(const Dev &d, const IPAddress &gw) {
-  bool print = (d.ports & (1 << 3)) || (d.ports & (1 << 4)) || (d.ports & (1 << 5));
-  bool web = (d.ports & 1) || (d.ports & 2) || (d.ports & 4);
+  bool print = (d.ports & (1 << 2)) || (d.ports & (1 << 3)) || (d.ports & (1 << 4));  // 9100/631/515
+  bool web = (d.ports & 1) || (d.ports & 2);                                          // 80/443
   if (print) return "Printer";
   if (d.ip == gw) return "Router (gateway)";
-  if (d.ports & (1 << 8)) return "Camera";
-  if (d.ports & (1 << 7)) return "PC / NAS (file share)";
-  if ((d.ports & (1 << 9)) && web) return "Router / AP";
-  if (d.ports & (1 << 6)) return "Linux / NAS (SSH)";
+  if (d.ports & (1 << 6)) return "PC / NAS (file share)";   // 445
+  if ((d.ports & (1 << 7)) && web) return "Router / AP";    // 53 + web
+  if (d.ports & (1 << 5)) return "Linux / NAS (SSH)";       // 22
   if (web) return "Device with web page";
   return "Device";
 }
@@ -2423,6 +2422,7 @@ static void lanScan() {
   IPAddress ip = WiFi.localIP(), gw = WiFi.gatewayIP(), mask = WiFi.subnetMask();
   uint32_t net = (uint32_t)ip & (uint32_t)mask;
   struct netif *nif = netif_default;
+  if (!nif) { fixDone(ST_FAIL, "Network interface not ready - try again in a few seconds."); return; }
   fixLine(ST_RUN, "Pinging addresses 1-254 on " + IPAddress(net).toString() + "/24 ...");
 
   // ARP-sweep in small batches so entries stay in the (small) ARP table while read.
@@ -2443,15 +2443,19 @@ static void lanScan() {
   fixUpdate(ST_OK, fmt("Found %d devices. Checking what each one is...", (int)devices.size()));
 
   // Fingerprint by probing a few common ports on each live device.
+  // Short timeouts and frequent yields so the web server/hotspot stay alive.
+  if (devices.size() > 80) devices.resize(80);
   int done = 0;
   for (auto &d : devices) {
     for (int p = 0; p < NPORTS; p++) {
       WiFiClient c;
-      if (c.connect(d.ip, PORT_LIST[p], 250)) { d.ports |= (1 << p); c.stop(); }
+      if (c.connect(d.ip, PORT_LIST[p], 180)) { d.ports |= (1 << p); c.stop(); }
+      delay(5);  // yield so loop() can serve the page
     }
     d.kind = classify(d, gw);
-    if (++done % 4 == 0) fixUpdate(ST_RUN, fmt("Identifying... %d/%d", done, (int)devices.size()));
+    if (++done % 3 == 0) fixUpdate(ST_RUN, fmt("Identifying... %d/%d", done, (int)devices.size()));
     pollSerial();
+    delay(10);
   }
 
   // Summary
@@ -2459,7 +2463,7 @@ static void lanScan() {
   String printerIp;
   for (auto &d : devices) {
     if (d.kind == "Printer") { printers++; printerIp = d.ip.toString(); }
-    if (d.ip != gw && (d.ports & (1 << 9))) dhcpish++;  // another host answering DNS: maybe a 2nd router
+    if (d.ip != gw && (d.ports & (1 << 7))) dhcpish++;  // another host answering DNS: maybe a 2nd router
   }
   std::sort(devices.begin(), devices.end(), [](const Dev &a, const Dev &b) { return (uint32_t)a.ip < (uint32_t)b.ip; });
 
