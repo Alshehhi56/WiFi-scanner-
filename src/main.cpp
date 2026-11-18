@@ -49,6 +49,8 @@
 #include <HTTPClient.h>
 #include "ping/ping_sock.h"
 #include "lwip/ip_addr.h"
+#include "lwip/etharp.h"
+#include "lwip/netif.h"
 #include <Update.h>
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
@@ -57,7 +59,7 @@
 #include <esp_crt_bundle.h>
 #include <mbedtls/sha256.h>
 
-#define FW_VERSION "3.4.0"
+#define FW_VERSION "3.5.0"
 #define DEFAULT_PASS "netdiag123"  // public default; change it with: pass NEWPASSWORD
 
 static const int MAX_CH = 13;    // channels 1..13 allowed in the UAE
@@ -954,7 +956,7 @@ static void handleRoot() {
     h += "Home LAN: not connected";
   h += String(" | Hotspot internet sharing: ") + (naptOk ? "ON" : "OFF");
   h += "</p><form method='post' action='/scan'><button>Scan now</button> <a href='/'>Refresh</a> | <a href='/api/report'>JSON</a></form>";
-  h += "<p><a href='/test' style='display:inline-block;padding:12px 18px;background:#0b2a6b;color:#fff;border-radius:22px;text-decoration:none'>Test Internet Connection &rarr;</a> <a href='/fixes' style='display:inline-block;padding:12px 18px;background:#1d7a3a;color:#fff;border-radius:22px;text-decoration:none'>Recommended fixes</a> <a href='/router'>Router access</a> &nbsp; <a href='/update'>Firmware &amp; system</a></p>";
+  h += "<p><a href='/test' style='display:inline-block;padding:12px 18px;background:#0b2a6b;color:#fff;border-radius:22px;text-decoration:none'>Test Internet Connection &rarr;</a> <a href='/fixes' style='display:inline-block;padding:12px 18px;background:#1d7a3a;color:#fff;border-radius:22px;text-decoration:none'>Recommended fixes</a> <a href='/router'>Router access</a> <a href='/devices'>Devices</a> &nbsp; <a href='/update'>Firmware &amp; system</a></p>";
   h += "<pre>" + htmlEsc(lastReport) + "</pre>";
 
   h += "<form method='post' action='/settings'><fieldset><legend>Diagnostics</legend>"
@@ -1376,6 +1378,7 @@ volatile bool fixRequested = false, fixRunning = false;
 static void runFixJob();
 static void runRouterIdentify();
 static void runRouterVerify();
+static void lanScan();
 
 static void testTask(void *) {
   for (;;) {
@@ -2003,6 +2006,7 @@ static void runFixJob() {
   else if (id.startsWith("test:")) { int i = id.substring(5).toInt(); fixReset(String("Verify: ") + STEP_NAME[i]); verifyByTest(i); }
   else if (id == "router:identify") { runRouterIdentify(); }
   else if (id == "router:verify") { runRouterVerify(); }
+  else if (id == "lan:scan") { lanScan(); }
   else if (id.startsWith("scan:")) { fixReset("Verify fix"); guidedVerifyScan(id.substring(5)); }
   else { fixReset("Unknown fix"); fixDone(ST_FAIL, "Unknown fix id"); }
 }
@@ -2345,6 +2349,155 @@ static void handleRouterCreds() {
   server.sendHeader("Location", "/fix");
   server.send(303);
 }
+// ============================================================ LAN DEVICE SCAN (v3.5)
+// Finds devices on your network, identifies maker (MAC) and type (open ports),
+// flags the printer and a possible second DHCP/router. Read-only.
+struct Dev {
+  IPAddress ip;
+  uint8_t mac[6] = {0};
+  bool hasMac = false;
+  uint16_t ports = 0;  // bitmask of PORT_LIST indices
+  String kind;
+};
+static const uint16_t PORT_LIST[] = {80, 443, 8080, 9100, 631, 515, 22, 445, 554, 53};
+static const int NPORTS = sizeof(PORT_LIST) / sizeof(PORT_LIST[0]);
+std::vector<Dev> devices;
+uint32_t lanScanCount = 0;
+
+static int findDev(const IPAddress &ip) {
+  for (size_t i = 0; i < devices.size(); i++)
+    if (devices[i].ip == ip) return (int)i;
+  return -1;
+}
+
+// Collect current ARP table entries into the device list.
+static void readArpTable() {
+  for (size_t i = 0; i < 16; i++) {
+    ip4_addr_t *ipaddr = nullptr;
+    struct netif *nif = nullptr;
+    struct eth_addr *eth = nullptr;
+    if (etharp_get_entry(i, &ipaddr, &nif, &eth) && ipaddr && eth) {
+      IPAddress ip(ip4_addr_get_u32(ipaddr));
+      int d = findDev(ip);
+      if (d < 0) { Dev nd; nd.ip = ip; devices.push_back(nd); d = devices.size() - 1; }
+      memcpy(devices[d].mac, eth->addr, 6);
+      devices[d].hasMac = true;
+    }
+  }
+}
+
+static String portName(int idx) {
+  switch (PORT_LIST[idx]) {
+    case 80: case 8080: return "web";
+    case 443: return "https";
+    case 9100: return "raw-print";
+    case 631: return "ipp-print";
+    case 515: return "lpr-print";
+    case 22: return "ssh";
+    case 445: return "smb";
+    case 554: return "rtsp";
+    case 53: return "dns";
+  }
+  return "";
+}
+
+static String classify(const Dev &d, const IPAddress &gw) {
+  bool print = (d.ports & (1 << 3)) || (d.ports & (1 << 4)) || (d.ports & (1 << 5));
+  bool web = (d.ports & 1) || (d.ports & 2) || (d.ports & 4);
+  if (print) return "Printer";
+  if (d.ip == gw) return "Router (gateway)";
+  if (d.ports & (1 << 8)) return "Camera";
+  if (d.ports & (1 << 7)) return "PC / NAS (file share)";
+  if ((d.ports & (1 << 9)) && web) return "Router / AP";
+  if (d.ports & (1 << 6)) return "Linux / NAS (SSH)";
+  if (web) return "Device with web page";
+  return "Device";
+}
+
+static void lanScan() {
+  fixReset("Scanning your network for devices");
+  if (WiFi.status() != WL_CONNECTED) { fixDone(ST_FAIL, "Connect the board to your Wi-Fi first."); return; }
+  devices.clear();
+  lanScanCount++;
+  IPAddress ip = WiFi.localIP(), gw = WiFi.gatewayIP(), mask = WiFi.subnetMask();
+  uint32_t net = (uint32_t)ip & (uint32_t)mask;
+  struct netif *nif = netif_default;
+  fixLine(ST_RUN, "Pinging addresses 1-254 on " + IPAddress(net).toString() + "/24 ...");
+
+  // ARP-sweep in small batches so entries stay in the (small) ARP table while read.
+  for (int base = 1; base <= 254; base += 6) {
+    for (int k = 0; k < 6 && base + k <= 254; k++) {
+      IPAddress t(net | htonl(base + k));
+      if (t == ip) continue;
+      ip4_addr_t a;
+      a.addr = (uint32_t)t;
+      if (nif) etharp_request(nif, &a);
+    }
+    delay(180);
+    readArpTable();
+    if ((base / 6) % 8 == 0) fixUpdate(ST_RUN, fmt("Pinging... %d/254, %d devices so far", base, (int)devices.size()));
+    pollSerial();
+  }
+  readArpTable();
+  fixUpdate(ST_OK, fmt("Found %d devices. Checking what each one is...", (int)devices.size()));
+
+  // Fingerprint by probing a few common ports on each live device.
+  int done = 0;
+  for (auto &d : devices) {
+    for (int p = 0; p < NPORTS; p++) {
+      WiFiClient c;
+      if (c.connect(d.ip, PORT_LIST[p], 250)) { d.ports |= (1 << p); c.stop(); }
+    }
+    d.kind = classify(d, gw);
+    if (++done % 4 == 0) fixUpdate(ST_RUN, fmt("Identifying... %d/%d", done, (int)devices.size()));
+    pollSerial();
+  }
+
+  // Summary
+  int printers = 0, dhcpish = 0;
+  String printerIp;
+  for (auto &d : devices) {
+    if (d.kind == "Printer") { printers++; printerIp = d.ip.toString(); }
+    if (d.ip != gw && (d.ports & (1 << 9))) dhcpish++;  // another host answering DNS: maybe a 2nd router
+  }
+  std::sort(devices.begin(), devices.end(), [](const Dev &a, const Dev &b) { return (uint32_t)a.ip < (uint32_t)b.ip; });
+
+  String msg = fmt("%d devices found. ", (int)devices.size());
+  if (printers) msg += "Printer at " + printerIp + " - add it to your phone by this IP. ";
+  else msg += "No printer detected (it may be off, or only reachable on another network). ";
+  if (dhcpish) msg += fmt("%d other device(s) answer DNS - possible second router; keep ONE DHCP (bridge the others).", dhcpish);
+  fixLine(printers ? ST_OK : ST_WARN, msg);
+  fixDone(printers ? ST_OK : ST_WARN, msg);
+}
+
+static void handleDevicesPage() {
+  if (!auth()) return;
+  IPAddress gw = WiFi.gatewayIP();
+  String h;
+  h.reserve(6000);
+  h += F("<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Devices</title>");
+  h += FIX_CSS;
+  h += "<style>table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:6px;border-top:1px solid #ffffff22;text-align:left}</style>";
+  h += "</head><body><h2>Devices on your network</h2>";
+  h += "<form method='post' action='/fix'><input type='hidden' name='id' value='lan:scan'><div style='padding:0 16px'>"
+       "<button class='go'>Scan now</button></div></form>";
+  if (!lanScanCount) h += "<p style='padding:0 16px'>Tap Scan to list every device, its maker and type.</p>";
+  else {
+    h += "<table><tr><th>IP</th><th>Maker</th><th>Type</th><th>Services</th></tr>";
+    for (auto &d : devices) {
+      String svc;
+      for (int p = 0; p < NPORTS; p++)
+        if (d.ports & (1 << p)) { if (svc.length()) svc += " "; svc += portName(p); }
+      String v = d.hasMac ? vendorFromMac(d.mac) : String("?");
+      h += "<tr><td>" + d.ip.toString() + (d.ip == gw ? " *" : "") + "</td><td>" + htmlEsc(v) + "</td><td>" +
+           htmlEsc(d.kind) + "</td><td>" + htmlEsc(svc) + "</td></tr>";
+    }
+    h += "</table><p style='padding:8px 16px;font-size:12px;color:#c8d3f0'>* = your router. A scan may miss sleeping devices; scan twice to be sure. "
+         "To print, add a device of type Printer to your phone by its IP address.</p>";
+  }
+  h += "<p style='padding:0 16px'><a href='/fixes'>&larr; Fixes</a> &nbsp; <a href='/'>Main page</a></p></body></html>";
+  server.send(200, "text/html", h);
+}
 
 static void startWeb() {
   server.on("/", HTTP_GET, handleRoot);
@@ -2366,6 +2519,7 @@ static void startWeb() {
   server.on("/fix", HTTP_GET, handleFixProgress);
   server.on("/router", HTTP_GET, handleRouterPage);
   server.on("/router/creds", HTTP_POST, handleRouterCreds);
+  server.on("/devices", HTTP_GET, handleDevicesPage);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
   server.begin();
 }
