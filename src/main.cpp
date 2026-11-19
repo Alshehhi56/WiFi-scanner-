@@ -1077,6 +1077,50 @@ static void printAccess() {
 }
 
 // ------------------------------------------------------------ web pages
+// Shared Apple-style theme (v3.9). Loaded after each page's own styles, so it overrides them;
+// light and dark mode follow the phone's setting.
+static const char STYLE_CSS[] PROGMEM = R"CSS(
+:root{--bg:#f5f5f7;--card:#fff;--text:#1d1d1f;--t2:#6e6e73;--accent:#0071e3;--sep:rgba(0,0,0,.08);--field:#f0f0f2;--term:#1d1d1f;--glass:rgba(245,245,247,.72);--ok:#248a3d;--warn:#b25000;--bad:#d70015;--info:#0071e3;color-scheme:light dark}
+@media(prefers-color-scheme:dark){:root{--bg:#000;--card:#1c1c1e;--text:#f5f5f7;--t2:#98989d;--accent:#2997ff;--sep:rgba(255,255,255,.1);--field:#2c2c2e;--term:#0e0e10;--glass:rgba(0,0,0,.66);--ok:#30d158;--warn:#ffd60a;--bad:#ff453a;--info:#64d2ff}}
+*{box-sizing:border-box}html{-webkit-text-size-adjust:100%;background:var(--bg)}
+body{max-width:720px;margin:0 auto!important;padding:0 16px 48px!important;background:var(--bg)!important;color:var(--text)!important;font:17px/1.47 -apple-system,BlinkMacSystemFont,"SF Pro Text",Inter,"Helvetica Neue",Arial,sans-serif!important;letter-spacing:-.01em;-webkit-font-smoothing:antialiased}
+h2,h3{font-weight:600!important;letter-spacing:-.022em;line-height:1.15}
+body>h2:first-of-type,body>h3:first-of-type{position:sticky;top:0;z-index:10;margin:0 -16px 12px!important;padding:14px 16px!important;font-size:22px;background:var(--glass);-webkit-backdrop-filter:blur(20px) saturate(180%);backdrop-filter:blur(20px) saturate(180%);border-bottom:1px solid var(--sep)}
+@media(prefers-reduced-transparency:reduce){body>h2:first-of-type,body>h3:first-of-type{background:var(--bg);-webkit-backdrop-filter:none;backdrop-filter:none}}
+a{color:var(--accent)!important;text-decoration:none}body>a{margin-left:0!important}
+[style*='padding:0 16px']{padding-left:0!important;padding-right:0!important}
+fieldset,.c{display:block;min-width:0;background:var(--card)!important;border:0!important;border-radius:18px!important;padding:16px!important;margin:12px 0!important;box-shadow:0 1px 3px rgba(0,0,0,.05)}
+legend{float:left;width:100%;padding:0;margin:0 0 8px;font-size:20px;font-weight:600;letter-spacing:-.02em}legend+*{clear:both}
+input:not([type=checkbox]):not([type=radio]):not([type=file]),select,textarea{display:block;width:100%!important;padding:12px 14px!important;margin:6px 0 12px!important;border:1px solid transparent;border-radius:12px;background:var(--field);color:var(--text);font:inherit;font-size:17px}
+select{display:inline-block;width:auto!important}
+input:focus,select:focus,textarea:focus,button:focus-visible{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 30%,transparent)}
+input[type=checkbox]{width:20px;height:20px;vertical-align:-4px;margin-right:6px;accent-color:var(--accent)}progress{accent-color:var(--accent);width:100%}
+button{-webkit-appearance:none;appearance:none;border:0!important;border-radius:980px!important;padding:11px 20px!important;margin:6px 6px 6px 0!important;font:inherit;font-size:16px!important;font-weight:500;background:var(--accent)!important;color:#fff!important;cursor:pointer;transition:transform .15s,opacity .15s}
+button:active{transform:scale(.97);opacity:.85}
+button[name=del],button[value=newkey],button[value=check],button.v,form[action='/reset'] button,form[action='/rollback'] button{background:var(--field)!important;color:var(--accent)!important}
+button[name=del],form[action='/reset'] button{color:var(--bad)!important}
+a[style*='border-radius:22px']{display:inline-block;background:var(--accent)!important;color:#fff!important;border-radius:980px!important;padding:11px 18px!important;margin:4px 4px 4px 0;font-weight:500}
+a[style*='#1d7a3a']{background:#248a3d!important}
+pre{background:var(--term)!important;color:#e5e5ea!important;border-radius:14px;padding:14px!important;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace!important;overflow-x:auto}
+p.m,p.s,p.w{border-radius:14px!important;padding:12px 14px!important;margin:12px 0}
+p.m{background:color-mix(in srgb,var(--ok) 14%,var(--card))!important}p.s{background:color-mix(in srgb,var(--accent) 12%,var(--card))!important}p.w{background:color-mix(in srgb,var(--warn) 16%,var(--card))!important}
+table{width:100%;border-collapse:collapse;font-size:15px}td,th{padding:8px 6px!important;border-top:1px solid var(--sep)!important;text-align:left;vertical-align:middle}tr:first-child td{border-top:0!important}
+.row{background:var(--card);border:0!important;border-radius:14px;margin:8px 0;padding:14px 16px!important;font-size:16px!important}.row .s{float:right;font-weight:600}
+.row .v{font-size:13px;color:var(--t2)!important;margin-top:4px}.row .t{font-size:13px;color:var(--warn)!important;margin-top:4px}
+.c .t{font-size:17px;font-weight:600}div.w,details{font-size:14px!important;color:var(--t2)!important}
+.b{display:inline-block;font-size:12px;font-weight:600;padding:3px 10px;border-radius:980px;margin-right:6px}
+.b.CRIT{background:color-mix(in srgb,var(--bad) 16%,transparent)!important;color:var(--bad)!important}.b.WARN{background:color-mix(in srgb,var(--warn) 18%,transparent)!important}.b.INFO{background:color-mix(in srgb,var(--info) 16%,transparent)!important;color:var(--info)!important}
+.OK,.OKs{color:var(--ok)!important}.WARN,.WARNs{color:var(--warn)!important}.FAIL,.CRIT{color:var(--bad)!important}.RUN{color:var(--info)!important}.WAIT,.SKIP{color:var(--t2)!important}
+[style*='color:#c8d3f0']{color:var(--t2)!important}[style*='color:#7dffa1']{color:var(--ok)!important}
+code{font:14px ui-monospace,Menlo,monospace;background:var(--field);padding:2px 6px;border-radius:6px}small{color:var(--t2)}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+)CSS";
+
+static void handleStyle() {
+  server.sendHeader("Cache-Control", "public, max-age=604800");
+  server.send_P(200, "text/css", STYLE_CSS);
+}
+
 static String htmlEsc(const String &s) {
   String o;
   o.reserve(s.length() + 64);
@@ -1116,7 +1160,7 @@ static void handleRoot() {
          "pre{background:#111;color:#ddd;padding:8px;font-size:11px;white-space:pre-wrap;word-break:break-word}"
          "fieldset{background:#fff;border:1px solid #ccc;border-radius:6px;margin:8px 0}"
          "input{width:95%;padding:6px;margin:3px 0}button{padding:10px 14px;margin:4px 0}"
-         ".m{background:#dfd;padding:6px;border-radius:4px}</style></head><body>");
+         ".m{background:#dfd;padding:6px;border-radius:4px}</style><link rel='stylesheet' href='/style.css?v=" FW_VERSION "'></head><body>");
   h += "<h3>NetDiag v" FW_VERSION "</h3>";
   if (msg.length()) h += "<p class='m'>" + htmlEsc(msg) + "</p>";
   h += fmt("<p>Cycle %u %s | ", cycleNo, cycleActive ? "<b>(scanning...)</b>" : "");
@@ -1649,7 +1693,7 @@ static void handleTestPage() {
          ".n{font-size:17px}.s{float:right;font-weight:bold}.v{font-size:12px;color:#c8d3f0;margin-top:4px;word-break:break-word}"
          ".t{font-size:12px;color:#ffd27a;margin-top:4px}.OK{color:#7dffa1}.WARN{color:#ffd27a}.FAIL{color:#ff7d7d}"
          ".RUN{color:#7dc8ff}.WAIT,.SKIP{color:#8a97b8}button{margin:16px;padding:12px 22px;font-size:16px;border-radius:24px;"
-         "border:0;background:#fff;color:#0b2a6b}a{color:#9fc3ff;margin-left:16px}</style></head><body>");
+         "border:0;background:#fff;color:#0b2a6b}a{color:#9fc3ff;margin-left:16px}</style><link rel='stylesheet' href='/style.css?v=" FW_VERSION "'></head><body>");
   h += F("<h2>Test Internet Connection</h2>");
   static const char *cls[] = {"WAIT", "RUN", "OK", "WARN", "FAIL", "SKIP"};
   if (testMux) xSemaphoreTake(testMux, portMAX_DELAY);
@@ -1939,7 +1983,7 @@ static void handleUpdatePage() {
   h += F("<title>Firmware</title><style>body{font-family:sans-serif;margin:8px;background:#f4f4f4}"
          "fieldset{background:#fff;border:1px solid #ccc;border-radius:6px;margin:8px 0}td{padding:2px 6px;font-size:13px}"
          "button{padding:10px 14px;margin:4px 0}.s{background:#e8f0ff;padding:8px;border-radius:4px}"
-         ".w{background:#fff3cd;padding:8px;border-radius:4px}</style></head><body>");
+         ".w{background:#fff3cd;padding:8px;border-radius:4px}</style><link rel='stylesheet' href='/style.css?v=" FW_VERSION "'></head><body>");
   h += "<h3>Firmware &amp; System</h3><p class='s'><b>Status:</b> " + htmlEsc(st);
   if (prog >= 0) h += fmt(" <progress max='100' value='%d'></progress>", prog);
   h += "</p>";
@@ -2378,7 +2422,8 @@ static const char *FIX_CSS =
     ".INFO{background:#7dc8ff;color:#023}button{padding:10px 18px;border-radius:20px;border:0;font-size:15px;margin-top:6px}"
     ".go{background:#7dffa1;color:#032}.v{background:#fff;color:#0b2a6b}details{font-size:13px;color:#dde}a{color:#9fc3ff}"
     "ol{padding-left:20px}.row{border-top:1px solid #ffffff22;padding:10px 16px;font-size:14px}.s{float:right;font-weight:bold}"
-    ".OK{color:#7dffa1}.RUN{color:#7dc8ff}.FAIL{color:#ff7d7d}.WARNs{color:#ffd27a}</style>";
+    ".OK{color:#7dffa1}.RUN{color:#7dc8ff}.FAIL{color:#ff7d7d}.WARNs{color:#ffd27a}</style>"
+    "<link rel='stylesheet' href='/style.css?v=" FW_VERSION "'>";
 
 static void handleFixesPage() {
   if (!auth()) return;
@@ -2666,7 +2711,7 @@ static void handleRouterCapture() {
   h.reserve(16000);
   h += F("<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Capture</title>");
   h += FIX_CSS;
-  h += "<style>textarea{width:95%;height:40vh;font-family:monospace;font-size:11px}</style></head><body>";
+  h += "<style>textarea{width:95%;height:40vh;font-family:monospace;font-size:11px}</style><link rel='stylesheet' href='/style.css?v=" FW_VERSION "'></head><body>";
   h += "<h2>Router page capture</h2>";
   h += "<form method='get' action='/router/capture' style='padding:0 16px'>Router IP:<br>"
        "<input name='host' value='" + htmlEsc(routerHost()) + "' style='width:70%;padding:6px'><br>Path:<br>"
@@ -2877,6 +2922,7 @@ static void startWeb() {
   server.on("/router/capture", HTTP_GET, handleRouterCapture);
   server.on("/devices", HTTP_GET, handleDevicesPage);
   server.on("/remote", HTTP_POST, handleRemote);
+  server.on("/style.css", HTTP_GET, handleStyle);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
   server.begin();
 }
