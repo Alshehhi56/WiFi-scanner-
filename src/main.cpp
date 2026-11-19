@@ -60,6 +60,7 @@
 #include <esp_crt_bundle.h>
 #include <mbedtls/sha256.h>
 #include "remote.h"
+#include "WiFiProv.h"
 
 #define FW_VERSION "3.9.0"
 #define DEFAULT_PASS "netdiag123"  // public default; change it with: pass NEWPASSWORD
@@ -127,7 +128,14 @@ struct Settings {
   String staSsid, staPass;  // your Wi-Fi (stored in flash only)
   String adminPass;         // web login + hotspot password
   bool customPass = false;  // true once you set your own password
+  uint8_t apMode = 2;       // hotspot: 0 always on, 1 only when Wi-Fi is lost, 2 off (Bluetooth backup)
 } cfg;
+
+// saved Wi-Fi networks (v3.9): the board joins the strongest one in range
+struct SavedNet { String ssid, pass; };
+static const int MAX_NETS = 5;
+std::vector<SavedNet> nets;
+std::vector<std::pair<String, int>> seenNets;  // SSIDs from the last scan (best RSSI), for the picker
 
 Preferences prefs;
 std::vector<String> homeList;
@@ -164,6 +172,14 @@ static void loadSettings() {
   cfg.staPass = prefs.getString("stapass", "");
   cfg.adminPass = prefs.getString("admin", "");
   cfg.customPass = prefs.getBool("custompw", false);
+  cfg.apMode = prefs.getUChar("apmode", 2);
+  if (cfg.apMode > 2) cfg.apMode = 2;
+  nets.clear();
+  for (int i = 0; i < MAX_NETS; i++) {
+    String ss = prefs.getString(("n" + String(i) + "s").c_str(), "");
+    if (ss.length()) nets.push_back({ss, prefs.getString(("n" + String(i) + "p").c_str(), "")});
+  }
+  if (nets.empty() && cfg.staSsid.length()) nets.push_back({cfg.staSsid, cfg.staPass});  // migrate v3.8
   if (cfg.rounds < 1 || cfg.rounds > 10) cfg.rounds = 4;
   if (cfg.intervalS < 10 || cfg.intervalS > 3600) cfg.intervalS = 60;
   parseHomeList();
@@ -179,6 +195,19 @@ static void saveSettings() {
   prefs.putString("stapass", cfg.staPass);
   prefs.putString("admin", cfg.adminPass);
   prefs.putBool("custompw", cfg.customPass);
+  prefs.putUChar("apmode", cfg.apMode);
+  for (int i = 0; i < MAX_NETS; i++) {
+    prefs.putString(("n" + String(i) + "s").c_str(), i < (int)nets.size() ? nets[i].ssid : String(""));
+    prefs.putString(("n" + String(i) + "p").c_str(), i < (int)nets.size() ? nets[i].pass : String(""));
+  }
+}
+
+// adds or updates a network and moves it to the top of the list
+static void rememberNet(const String &ssid, const String &pass) {
+  for (size_t i = 0; i < nets.size(); i++)
+    if (nets[i].ssid == ssid) { nets.erase(nets.begin() + i); break; }
+  nets.insert(nets.begin(), {ssid, pass});
+  if ((int)nets.size() > MAX_NETS) nets.pop_back();
 }
 
 // ------------------------------------------------------------ status LED
@@ -890,9 +919,148 @@ static void startHotspot() {
 }
 
 static void startStation() {
+  if (!cfg.staSsid.length() && !nets.empty()) { cfg.staSsid = nets[0].ssid; cfg.staPass = nets[0].pass; }
   if (!cfg.staSsid.length()) return;
   Serial.printf("> joining Wi-Fi '%s' ...\n", cfg.staSsid.c_str());
   WiFi.begin(cfg.staSsid.c_str(), cfg.staPass.c_str());
+}
+
+// ------------------------------------------------------------ Wi-Fi manager (v3.9)
+// Saved networks, hotspot modes and Bluetooth setup when the Wi-Fi is lost.
+extern bool cycleActive;
+extern volatile bool testRunning, testRequested, otaBusy;
+bool apOn = true;  // the hotspot starts at boot and stays until the first connection
+volatile bool bleActive = false, provDone = false;
+String provSsid, provPass;
+uint32_t bleStart = 0;
+bool bleTried = false;
+static const uint32_t BLE_WINDOW_MS = 10UL * 60 * 1000;
+static const char *AP_MODE_NAMES[] = {"Always on", "Only when Wi-Fi is lost", "Off (Bluetooth backup)"};
+
+static void useNet(const SavedNet &n) {
+  cfg.staSsid = n.ssid;
+  cfg.staPass = n.pass;
+  saveSettings();
+  WiFi.disconnect();
+  delay(100);
+  startStation();
+}
+
+static void hotspotOn() {
+  if (apOn) return;
+  WiFi.mode(WIFI_AP_STA);
+  startHotspot();
+  apOn = true;
+}
+
+static void hotspotOff() {
+  if (!apOn) return;
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  apOn = false;
+  naptOk = false;
+  Serial.println("> hotspot off (home Wi-Fi works)");
+}
+
+// quick scan: remember what is in range and join the strongest saved network
+static void connectBest() {
+  int n = WiFi.scanNetworks(false, true);
+  if (n < 0) return;
+  std::map<String, int> best;
+  for (int i = 0; i < n; i++) {
+    String ss = WiFi.SSID(i);
+    if (!ss.length()) continue;
+    int r = WiFi.RSSI(i);
+    if (!best.count(ss) || r > best[ss]) best[ss] = r;
+  }
+  WiFi.scanDelete();
+  seenNets.assign(best.begin(), best.end());
+  std::sort(seenNets.begin(), seenNets.end(), [](const std::pair<String, int> &a, const std::pair<String, int> &b) { return a.second > b.second; });
+  int pick = -1, pickR = -127;
+  for (size_t i = 0; i < nets.size(); i++)
+    if (best.count(nets[i].ssid) && best[nets[i].ssid] > pickR) { pick = i; pickR = best[nets[i].ssid]; }
+  if (pick < 0) { Serial.println("> none of the saved networks is in range"); return; }
+  Serial.printf("> strongest saved network: %s (%d dBm)\n", nets[pick].ssid.c_str(), pickR);
+  useNet(nets[pick]);
+}
+
+#if defined(CONFIG_BLUEDROID_ENABLED) || defined(CONFIG_NIMBLE_ENABLED)
+#define HAVE_BLE_PROV 1
+static void provEvent(arduino_event_t *e) {
+  if (e->event_id == ARDUINO_EVENT_PROV_CRED_RECV) {
+    char ss[33] = {0}, pw[65] = {0};
+    memcpy(ss, e->event_info.prov_cred_recv.ssid, 32);
+    memcpy(pw, e->event_info.prov_cred_recv.password, 64);
+    provSsid = ss;
+    provPass = pw;
+  } else if (e->event_id == ARDUINO_EVENT_PROV_CRED_SUCCESS) {
+    provDone = true;
+  } else if (e->event_id == ARDUINO_EVENT_PROV_CRED_FAIL) {
+    Serial.println("> Bluetooth setup: could not join that network (wrong password or out of range) - try again in the app");
+  }
+}
+#endif
+
+static void bleBegin() {
+  bleTried = true;
+#ifdef HAVE_BLE_PROV
+  String svc = "PROV_" + apName;
+  uint8_t uuid[16] = {0xb4, 0xdf, 0x5a, 0x1c, 0x3f, 0x6b, 0xf4, 0xbf, 0xea, 0x4a, 0x82, 0x03, 0x04, 0x90, 0x1a, 0x02};
+  Serial.printf("> Bluetooth Wi-Fi setup ON for 10 min: open the 'ESP BLE Provisioning' app, pick %s, code = your NetDiag password\n", svc.c_str());
+  bleActive = true;
+  bleStart = millis();
+  WiFi.onEvent(provEvent);
+  WiFiProv.beginProvision(NETWORK_PROV_SCHEME_BLE, NETWORK_PROV_SCHEME_HANDLER_FREE_BLE, NETWORK_PROV_SECURITY_1,
+                          cfg.adminPass.c_str(), svc.c_str(), NULL, uuid, true);
+#else
+  Serial.println("> Bluetooth setup is not available in this build");
+#endif
+}
+
+static String bleStatus() {
+  if (bleActive) return "ON - app 'ESP BLE Provisioning', device PROV_" + apName;
+  return cfg.apMode == 0 ? "not used (hotspot always on)" : "standby (starts 3 min after Wi-Fi is lost)";
+}
+
+static void wifiMgrTick() {
+  static uint32_t last = 0, upSince = 0, downSince = 0, lastTry = 0;
+  uint32_t now = millis();
+  if (provDone) {  // new network received over Bluetooth and it works: save and restart cleanly
+    rememberNet(provSsid, provPass);
+    cfg.staSsid = provSsid;
+    cfg.staPass = provPass;
+    saveSettings();
+    Serial.printf("> Bluetooth setup: joined '%s', saved. Restarting...\n", provSsid.c_str());
+    delay(1500);
+    ESP.restart();
+  }
+  if (now - last < 1000) return;
+  last = now;
+  bool up = WiFi.status() == WL_CONNECTED;
+  if (up) {
+    downSince = 0;
+    if (!upSince) upSince = now;
+    if (cfg.apMode != 0 && apOn && now - upSince > 30000 && !bleActive) hotspotOff();
+    return;
+  }
+  upSince = 0;
+  if (!downSince) downSince = now;
+  uint32_t down = now - downSince;
+  if (bleActive) {
+    if (now - bleStart > BLE_WINDOW_MS) {  // nothing received: restart (hotspot is on again until Wi-Fi connects)
+      Serial.println("> Bluetooth setup timed out - restarting");
+      delay(500);
+      ESP.restart();
+    }
+    return;
+  }
+  if (cfg.apMode == 0 || (cfg.apMode == 1 && down > 60000)) hotspotOn();
+  bool busy = cycleActive || testRunning || testRequested || otaBusy;
+  if (!nets.empty() && down > 15000 && now - lastTry > 30000 && !busy) {
+    lastTry = now;
+    connectBest();
+  }
+  if (cfg.apMode != 0 && !bleTried && !busy && down > (nets.empty() ? 10000UL : 180000UL)) bleBegin();
 }
 
 static void printAccess() {
@@ -967,10 +1135,31 @@ static void handleRoot() {
        "Seconds between cycles (10-3600)<input name='interval' type='number' value='" + String(cfg.intervalS) + "'>"
        "<button>Save</button></fieldset></form>";
 
-  h += "<form method='post' action='/wifi'><fieldset><legend>Join my Wi-Fi (2.4 GHz)</legend>"
-       "SSID<input name='ssid' value='" + htmlEsc(cfg.staSsid) + "'>"
-       "Password<input name='pass' type='password' placeholder='(unchanged if empty)'>"
-       "<button>Connect</button> <button name='forget' value='1'>Forget</button></fieldset></form>";
+  h += "<form method='post' action='/wifi'><fieldset id='wifi'><legend>My Wi-Fi networks (2.4 GHz)</legend>";
+  if (nets.empty()) h += "<p>No networks saved yet.</p>";
+  else {
+    h += "<table style='width:100%;font-size:14px'>";
+    for (size_t i = 0; i < nets.size(); i++) {
+      bool cur = WiFi.status() == WL_CONNECTED && nets[i].ssid == WiFi.SSID();
+      String sig;
+      for (auto &sn : seenNets)
+        if (sn.first == nets[i].ssid) { sig = fmt(" %d dBm", sn.second); break; }
+      h += "<tr><td>" + htmlEsc(nets[i].ssid) + (cur ? " <b>&#10003; connected</b>" : "") + "<small>" + sig + "</small></td><td style='text-align:right;white-space:nowrap'>";
+      if (!cur) h += "<button name='use' value='" + String(i) + "'>Connect</button> ";
+      h += "<button name='del' value='" + String(i) + "'>Remove</button></td></tr>";
+    }
+    h += "</table>";
+  }
+  h += "<p><b>Add a network</b> (pick from the scan or type the name)<br>"
+       "<input name='ssid' list='nets' autocomplete='off' placeholder='Network name'><datalist id='nets'>";
+  for (auto &sn : seenNets) h += "<option value='" + htmlEsc(sn.first) + "'>" + fmt("%d dBm", sn.second) + "</option>";
+  h += "</datalist>Password<input name='pass' type='password' autocomplete='new-password' placeholder='Leave empty for open network'>"
+       "<button name='a' value='add'>Save &amp; connect</button></p>";
+  h += "<p><b>Hotspot " + htmlEsc(apName) + "</b><br><select name='apmode' style='padding:6px'>";
+  for (int i = 0; i < 3; i++)
+    h += "<option value='" + String(i) + "'" + (cfg.apMode == i ? " selected" : "") + ">" + AP_MODE_NAMES[i] + "</option>";
+  h += "</select> <button name='a' value='mode'>Save</button><br><small>Hotspot now: " + String(apOn ? "on" : "off") +
+       " | Bluetooth setup: " + htmlEsc(bleStatus()) + "</small></p></fieldset></form>";
 
   h += "<form method='post' action='/password'><fieldset><legend>Admin / hotspot password</legend>"
        "New password (8+ chars)<input name='p1' type='password'>Repeat<input name='p2' type='password'>"
@@ -1000,23 +1189,45 @@ static void handleSettings() {
 
 static void handleWifi() {
   if (!auth()) return;
-  if (server.arg("forget") == "1") {
-    cfg.staSsid = ""; cfg.staPass = "";
+  String a = server.arg("a");
+  if (server.hasArg("del")) {
+    int i = server.arg("del").toInt();
+    if (i < 0 || i >= (int)nets.size()) { sendRedirect("Unknown network"); return; }
+    String ss = nets[i].ssid;
+    nets.erase(nets.begin() + i);
     saveSettings();
-    WiFi.disconnect(false, true);
-    sendRedirect("Home Wi-Fi forgotten");
+    sendRedirect("Removed " + ss);
+    return;
+  }
+  if (server.hasArg("use")) {
+    int i = server.arg("use").toInt();
+    if (i < 0 || i >= (int)nets.size()) { sendRedirect("Unknown network"); return; }
+    SavedNet n = nets[i];
+    sendRedirect("Connecting to " + n.ssid + " - refresh in 15 s");
+    delay(200);
+    useNet(n);
+    return;
+  }
+  if (a == "mode") {
+    int m = server.arg("apmode").toInt();
+    if (m < 0 || m > 2) m = 2;
+    cfg.apMode = m;
+    saveSettings();
+    if (m == 0) hotspotOn();
+    sendRedirect(String("Hotspot: ") + AP_MODE_NAMES[m]);
     return;
   }
   String ss = server.arg("ssid"), pw = server.arg("pass");
   ss.trim();
-  if (!ss.length()) { sendRedirect("SSID is empty"); return; }
-  if (ss != cfg.staSsid || pw.length()) cfg.staPass = pw;
-  cfg.staSsid = ss;
+  if (!ss.length()) { sendRedirect("Network name is empty"); return; }
+  if (!pw.length())  // keep the saved password when re-adding a known network without one
+    for (auto &n : nets)
+      if (n.ssid == ss) { pw = n.pass; break; }
+  rememberNet(ss, pw);
   saveSettings();
-  sendRedirect("Connecting to " + ss + " - check the status line in 15 s");
+  sendRedirect("Saved. Connecting to " + ss + " - refresh in 15 s");
   delay(200);
-  WiFi.disconnect();
-  startStation();
+  useNet(nets[0]);
 }
 
 static void handlePassword() {
@@ -2681,8 +2892,9 @@ static void printHelp() {
   Serial.println("  raw on|off         access point table");
   Serial.println("  json on|off        machine-readable report");
   Serial.println("  wifi               show hotspot / web access details");
-  Serial.println("  wifi SSID|PASSWORD join your Wi-Fi (note the | between)");
-  Serial.println("  wifi -             forget your Wi-Fi");
+  Serial.println("  wifi SSID|PASSWORD save a network and join it (up to 5 saved)");
+  Serial.println("  wifi -             forget all saved networks");
+  Serial.println("  wifi ble           start Bluetooth Wi-Fi setup now");
   Serial.println("  pass NEWPASSWORD   set hotspot + web password (8+ chars)");
   Serial.println("  reset              clear persistence history");
   Serial.println("  test               run the internet connection test");
@@ -2748,15 +2960,14 @@ static void handleCommand(String line) {
   }
   else if (cmd == "wifi") {
     if (!arg.length()) printAccess();
-    else if (arg == "-") { cfg.staSsid = ""; cfg.staPass = ""; saveSettings(); WiFi.disconnect(false, true); Serial.println("> Wi-Fi forgotten"); }
+    else if (arg == "-") { cfg.staSsid = ""; cfg.staPass = ""; nets.clear(); saveSettings(); WiFi.disconnect(false, true); Serial.println("> all saved networks forgotten"); }
+    else if (arg == "ble") { if (bleActive) Serial.println("> Bluetooth setup already on"); else bleBegin(); }
     else {
       int bar = arg.indexOf('|');
       if (bar < 1) { Serial.println("> use: wifi SSID|PASSWORD"); return; }
-      cfg.staSsid = arg.substring(0, bar);
-      cfg.staPass = arg.substring(bar + 1);
-      saveSettings();
-      WiFi.disconnect();
-      startStation();
+      rememberNet(arg.substring(0, bar), arg.substring(bar + 1));
+      useNet(nets[0]);
+      Serial.printf("> saved (%d networks). Joining %s\n", (int)nets.size(), nets[0].ssid.c_str());
     }
   }
   else if (cmd == "remote") {
@@ -2804,6 +3015,13 @@ static void stepCycle() {
     StrPrint rp;
     printReport(rp);
     lastReport = rp.s;
+    {
+      std::map<String, int> best;
+      for (auto &a : aps)
+        if (a.ssid.length() && (!best.count(a.ssid) || a.avg() > best[a.ssid])) best[a.ssid] = (int)a.avg();
+      seenNets.assign(best.begin(), best.end());
+      std::sort(seenNets.begin(), seenNets.end(), [](const std::pair<String, int> &x, const std::pair<String, int> &y) { return x.second > y.second; });
+    }
     Serial.print(lastReport);
     printAccess();
     cycleActive = false;
@@ -2859,6 +3077,7 @@ void loop() {
   server.handleClient();
   pollSerial();
   otaHealthTick();
+  wifiMgrTick();
 
   bool up = WiFi.status() == WL_CONNECTED;
   if (up != staWasConnected) {
@@ -2869,7 +3088,7 @@ void loop() {
 
   if (cycleActive) {
     stepCycle();
-  } else if (testRunning || testRequested || otaBusy) {
+  } else if (testRunning || testRequested || otaBusy || bleActive) {
     // pause Wi-Fi scans while the connection test runs
   } else if (scanRequested || millis() - lastCycle >= (unsigned long)cfg.intervalS * 1000UL) {
     scanRequested = false;
