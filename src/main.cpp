@@ -1792,6 +1792,7 @@ static esp_err_t manifestEvt(esp_http_client_event_t *e) {
 static bool otaCheck() {
   if (WiFi.status() != WL_CONNECTED) { setOta("Not connected to your Wi-Fi - join it first"); return false; }
   setOta("Checking GitHub for new firmware...");
+  vTaskDelay(pdMS_TO_TICKS(2500));  // let a Wi-Fi scan in progress finish (scans pause while OTA is busy)
   String body;
   esp_http_client_config_t c;
   memset(&c, 0, sizeof(c));
@@ -1803,11 +1804,19 @@ static bool otaCheck() {
   c.max_redirection_count = 6;
   c.buffer_size = 4096;
   c.buffer_size_tx = 4096;
-  esp_http_client_handle_t h = esp_http_client_init(&c);
-  if (!h) { setOta("Check failed: HTTP client init"); return false; }
-  esp_err_t r = esp_http_client_perform(h);
-  int st = esp_http_client_get_status_code(h);
-  esp_http_client_cleanup(h);
+  esp_err_t r = ESP_FAIL;
+  int st = 0;
+  for (int attempt = 1; attempt <= 3; attempt++) {  // a busy radio or slow DNS can fail the first try
+    body = "";
+    esp_http_client_handle_t h = esp_http_client_init(&c);
+    if (!h) { setOta("Check failed: HTTP client init"); return false; }
+    r = esp_http_client_perform(h);
+    st = esp_http_client_get_status_code(h);
+    esp_http_client_cleanup(h);
+    if (r == ESP_OK) break;
+    setOta(fmt("Checking GitHub... retry %d of 3 (%s)", attempt, esp_err_to_name(r)));
+    vTaskDelay(pdMS_TO_TICKS(3000));
+  }
   if (r != ESP_OK) { setOta(String("Check failed: ") + esp_err_to_name(r)); return false; }
   if (st != 200) { setOta(fmt("Check failed: HTTP %d (no release published yet?)", st)); return false; }
   otaLatestVer = jsonField(body, "version");
@@ -3132,9 +3141,9 @@ void loop() {
     else Serial.println("> home Wi-Fi disconnected");
   }
 
-  if (cycleActive) {
+  if (cycleActive && !(otaBusy || otaCheckReq || otaInstallReq)) {
     stepCycle();
-  } else if (testRunning || testRequested || otaBusy || bleActive) {
+  } else if (testRunning || testRequested || otaBusy || otaCheckReq || otaInstallReq || bleActive || cycleActive) {
     // pause Wi-Fi scans while the connection test runs
   } else if (scanRequested || millis() - lastCycle >= (unsigned long)cfg.intervalS * 1000UL) {
     scanRequested = false;
