@@ -965,6 +965,38 @@ static void hotspotOff() {
   Serial.println("> hotspot off (home Wi-Fi works)");
 }
 
+// ---- internet watchdog: a network that connects but has no internet is "trapped"
+volatile int inetBad = 0;          // consecutive failed internet checks on the current network
+volatile bool inetOk = false;
+uint32_t noInetAt[MAX_NETS] = {0};  // when each saved network was last found without internet
+String lastGoodSsid;                // last network that really had internet (saved in flash)
+
+static bool internetReachable() {
+  static const IPAddress hosts[] = {IPAddress(1, 1, 1, 1), IPAddress(8, 8, 8, 8), IPAddress(9, 9, 9, 9)};
+  for (auto &h : hosts) {
+    WiFiClient c;
+    if (c.connect(h, 443, 3000)) { c.stop(); return true; }
+  }
+  return false;
+}
+
+static void inetTask(void *) {
+  vTaskDelay(pdMS_TO_TICKS(30000));
+  while (true) {
+    if (WiFi.status() == WL_CONNECTED && !cycleActive && !otaBusy) {
+      if (internetReachable()) { inetBad = 0; inetOk = true; }
+      else { inetBad = inetBad + 1; inetOk = false; Serial.printf("> no internet on %s (%d)\n", WiFi.SSID().c_str(), (int)inetBad); }
+    } else if (WiFi.status() != WL_CONNECTED) { inetBad = 0; inetOk = false; }
+    vTaskDelay(pdMS_TO_TICKS(inetBad ? 30000 : 60000));
+  }
+}
+
+static int netIndex(const String &ssid) {
+  for (size_t i = 0; i < nets.size() && i < (size_t)MAX_NETS; i++)
+    if (nets[i].ssid == ssid) return i;
+  return -1;
+}
+
 // quick scan: remember what is in range and join the strongest saved network
 static void connectBest() {
   int n = WiFi.scanNetworks(false, true);
@@ -987,10 +1019,16 @@ static void connectBest() {
   for (size_t i = 0; i < nets.size() && i < (size_t)MAX_NETS; i++) {
     if (!best.count(nets[i].ssid)) continue;
     int score = best[nets[i].ssid] - 25 * netFails[i];
+    if (noInetAt[i] && millis() - noInetAt[i] < 15UL * 60 * 1000) score -= 200;  // no internet in the last 15 min
+    if (nets[i].ssid == lastGoodSsid) score += 15;                                // prefer the last network that worked
     if (score > pickScore) { pick = i; pickScore = score; }
   }
   if (pick < 0) { Serial.println("> none of the saved networks is in range"); lastTried = -1; return; }
   Serial.printf("> trying saved network %s (%d dBm, %u failed tries)\n", nets[pick].ssid.c_str(), best[nets[pick].ssid], netFails[pick]);
+  if (WiFi.status() == WL_CONNECTED && nets[pick].ssid == WiFi.SSID()) {  // nothing better in range: stay
+    Serial.println("> no better network in range - staying");
+    return;
+  }
   lastTried = pick;
   useNet(nets[pick]);
 }
@@ -1051,6 +1089,26 @@ static void wifiMgrTick() {
   if (up) {
     downSince = 0;
     if (!upSince) { upSince = now; memset(netFails, 0, sizeof netFails); lastTried = -1; }
+    String cur = WiFi.SSID();
+    if (inetOk && cur.length() && cur != lastGoodSsid) {
+      lastGoodSsid = cur;
+      prefs.putString("lastgood", cur);
+      int ci = netIndex(cur);
+      if (ci >= 0) noInetAt[ci] = 0;
+    }
+    // trapped: connected but no internet for about 2 minutes -> go back to a network that works
+    bool busyNow = cycleActive || testRunning || testRequested || otaBusy;
+    if (inetBad >= 3 && nets.size() > 1 && !busyNow && now - lastTry > 60000) {
+      int ci = netIndex(cur);
+      if (ci >= 0) noInetAt[ci] = now ? now : 1;
+      Serial.printf("> %s has no internet - switching back to %s\n", cur.c_str(),
+                    lastGoodSsid.length() ? lastGoodSsid.c_str() : "another saved network");
+      lastTry = now;
+      inetBad = 0;
+      lastTried = -1;
+      connectBest();
+      return;
+    }
     // keep the hotspot for the first 5 minutes after every start, so you can always find the board
     if (cfg.apMode != 0 && apOn && now - upSince > 30000 && now > 300000UL && !bleActive) hotspotOff();
     return;
@@ -1201,7 +1259,11 @@ static void handleRoot() {
       String sig;
       for (auto &sn : seenNets)
         if (sn.first == nets[i].ssid) { sig = fmt(" %d dBm", sn.second); break; }
-      h += "<tr><td>" + htmlEsc(nets[i].ssid) + (cur ? " <b>&#10003; connected</b>" : "") + "<small>" + sig + "</small></td><td style='text-align:right;white-space:nowrap'>";
+      String note;
+      if (cur) note = inetOk ? " <b>&#10003; connected</b>" : " <b>connected, no internet</b>";
+      else if (i < (size_t)MAX_NETS && noInetAt[i] && millis() - noInetAt[i] < 15UL * 60 * 1000) note = " <small>(no internet, skipped)</small>";
+      if (nets[i].ssid == lastGoodSsid && !cur) note += " <small>last working</small>";
+      h += "<tr><td>" + htmlEsc(nets[i].ssid) + note + "<small>" + sig + "</small></td><td style='text-align:right;white-space:nowrap'>";
       if (!cur) h += "<button name='use' value='" + String(i) + "'>Connect</button> ";
       h += "<button name='del' value='" + String(i) + "'>Remove</button></td></tr>";
     }
@@ -3132,6 +3194,8 @@ void setup() {
   otaBootCheck();
   xTaskCreatePinnedToCore(otaTask, "ota", 12288, nullptr, 1, nullptr, 1);
   xTaskCreatePinnedToCore(testTask, "nettest", 16384, nullptr, 1, nullptr, 1);
+  lastGoodSsid = prefs.getString("lastgood", "");
+  xTaskCreatePinnedToCore(inetTask, "inetchk", 4096, nullptr, 1, nullptr, 1);
   startWeb();
   if (MDNS.begin("netdiag")) MDNS.addService("http", "tcp", 80);
   remoteBegin(FW_VERSION);
