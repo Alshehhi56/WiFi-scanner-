@@ -3,6 +3,9 @@ name: Build ESP32-S3 Firmware
 
 on:
   push:
+    paths-ignore:          # Worker-only changes must not rebuild or republish firmware
+      - 'cloud/**'
+      - '.github/workflows/deploy-cloud.yml'
   workflow_dispatch:
 
 permissions:

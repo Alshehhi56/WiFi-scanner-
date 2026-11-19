@@ -59,8 +59,9 @@
 #include <esp_http_client.h>
 #include <esp_crt_bundle.h>
 #include <mbedtls/sha256.h>
+#include "remote.h"
 
-#define FW_VERSION "3.8.0"
+#define FW_VERSION "3.9.0"
 #define DEFAULT_PASS "netdiag123"  // public default; change it with: pass NEWPASSWORD
 
 static const int MAX_CH = 13;    // channels 1..13 allowed in the UAE
@@ -1711,6 +1712,8 @@ static bool canRollback(String &info) {
 }
 
 // ---- web: /update
+static String remoteFieldset();
+
 static void handleUpdatePage() {
   if (!auth()) return;
   int prog = -1;
@@ -1746,6 +1749,7 @@ static void handleUpdatePage() {
   if (rb) h += "<label><input type='checkbox' name='yes' value='1'> I want to go back</label><br><button>Roll back &amp; restart</button>";
   h += "</fieldset></form>";
 
+  h += remoteFieldset();
   h += "<fieldset><legend>System</legend><table>";
   h += "<tr><td>Firmware</td><td>v" FW_VERSION " built " __DATE__ " " __TIME__ "</td></tr>";
   h += fmt("<tr><td>Chip</td><td>%s rev %d, %d cores, %lu MHz</td></tr>", ESP.getChipModel(), ESP.getChipRevision(),
@@ -1770,6 +1774,45 @@ static void handleUpdatePage() {
   esp_partition_iterator_release(it);
   h += "</table></fieldset><a href='/'>&larr; Back</a></body></html>";
   server.send(200, "text/html", h);
+}
+
+// ------------------------------------------------------------ remote access settings (v3.9)
+// Requests relayed from the Cloudflare Worker arrive from 127.0.0.1.
+static bool viaRemote() { return server.client().remoteIP() == IPAddress(127, 0, 0, 1); }
+
+static String remoteFieldset() {
+  String m = server.arg("rm");
+  String h = "<form method='post' action='/remote'><fieldset id='remote'><legend>Remote access (Cloudflare)</legend>";
+  if (m.length()) h += "<p class='w'>" + htmlEsc(m) + "</p>";
+  h += "<p class='s'><b>Status:</b> " + htmlEsc(remoteStatus()) + "</p>";
+  if (viaRemote()) {
+    h += "You are connected remotely. These settings can only be changed on your home network.</fieldset></form>";
+    return h;
+  }
+  h += String("<label><input type='checkbox' name='on' value='1'") + (remoteEnabled() ? " checked" : "") +
+       " style='width:auto'> Enable remote access</label><br>"
+       "Worker address<br><input name='host' style='width:95%;padding:6px' placeholder='netdiag-remote.yourname.workers.dev' value='" +
+       htmlEsc(remoteHost()) + "'><br>";
+  if (remoteKey().length())
+    h += "Device key (save it in GitHub as secret <b>NETDIAG_DEVICE_KEY</b>):<br><code style='word-break:break-all'>" +
+         htmlEsc(remoteKey()) + "</code><br>";
+  h += "<button name='a' value='save'>Save</button> <button name='a' value='newkey'>New device key</button>"
+       "</fieldset></form>";
+  return h;
+}
+
+static void handleRemote() {
+  if (!auth()) return;
+  String a = server.arg("a"), m;
+  if (viaRemote()) m = "Remote access settings can only be changed on your home network.";
+  else if (a == "newkey") { remoteNewKey(); m = "New key made. Update NETDIAG_DEVICE_KEY in GitHub, then run the deploy again."; }
+  else {
+    bool on = server.arg("on") == "1";
+    if (on && !cfg.customPass) m = "Set your own password on the main page first. The default password is public.";
+    else { remoteSet(on, server.arg("host")); m = on ? "Saved. Connecting..." : "Remote access turned off."; }
+  }
+  server.sendHeader("Location", "/update?rm=" + m + "#remote");
+  server.send(303);
 }
 
 static void handleOtaAction() {
@@ -2622,6 +2665,7 @@ static void startWeb() {
   server.on("/router/creds", HTTP_POST, handleRouterCreds);
   server.on("/router/capture", HTTP_GET, handleRouterCapture);
   server.on("/devices", HTTP_GET, handleDevicesPage);
+  server.on("/remote", HTTP_POST, handleRemote);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
   server.begin();
 }
@@ -2644,6 +2688,10 @@ static void printHelp() {
   Serial.println("  test               run the internet connection test");
   Serial.println("  ota                check GitHub for new firmware");
   Serial.println("  ota install        download and install it");
+  Serial.println("  remote             remote access status and device key");
+  Serial.println("  remote on|off      turn remote access on or off");
+  Serial.println("  remote host NAME   set the Worker address");
+  Serial.println("  remote newkey      make a new device key");
   Serial.println("  status             show settings");
 }
 
@@ -2710,6 +2758,15 @@ static void handleCommand(String line) {
       WiFi.disconnect();
       startStation();
     }
+  }
+  else if (cmd == "remote") {
+    if (arg == "on" && !cfg.customPass) Serial.println("> set your own password first: pass NEWPASSWORD");
+    else if (arg == "on" || arg == "off") remoteSet(arg == "on", remoteHost());
+    else if (arg.startsWith("host ")) remoteSet(remoteEnabled(), arg.substring(5));
+    else if (arg == "newkey") remoteNewKey();
+    Serial.printf("> remote: %s | host=%s\n> status: %s\n> device key: %s\n", remoteEnabled() ? "on" : "off",
+                  remoteHost().length() ? remoteHost().c_str() : "(none)", remoteStatus().c_str(),
+                  remoteKey().length() ? remoteKey().c_str() : "(none yet)");
   }
   else Serial.println("> unknown command, type 'help'");
 }
@@ -2791,6 +2848,7 @@ void setup() {
   xTaskCreatePinnedToCore(testTask, "nettest", 16384, nullptr, 1, nullptr, 1);
   startWeb();
   if (MDNS.begin("netdiag")) MDNS.addService("http", "tcp", 80);
+  remoteBegin(FW_VERSION);
 
   printStatus();
   printAccess();
