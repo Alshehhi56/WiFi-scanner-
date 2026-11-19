@@ -66,3 +66,17 @@ jobs:
               --notes "Built from ${GITHUB_SHA::7}. OTA: firmware.bin. USB: merged-firmware.bin at 0x0." --latest
           fi
           gh release upload "v$VER" firmware.bin merged-firmware.bin manifest.json --clobber
+
+      - name: Publish test build (other branches, never used by OTA)
+        if: github.ref != 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VER=$(grep -oP '#define FW_VERSION "\K[^"]+' src/main.cpp)
+          TAG="test-${GITHUB_REF_NAME//\//-}"
+          cp .pio/build/esp32s3/firmware.bin firmware.bin
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --prerelease --target "$GITHUB_SHA" --title "TEST v$VER ($GITHUB_REF_NAME)" \
+              --notes "Test build - not offered by OTA. Upload firmware.bin on the board's Firmware page."
+          gh release edit "$TAG" --prerelease --title "TEST v$VER (${GITHUB_SHA::7})"
+          gh release upload "$TAG" firmware.bin merged-firmware.bin --clobber
