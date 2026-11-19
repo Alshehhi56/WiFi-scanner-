@@ -937,6 +937,9 @@ bool bleTried = false;
 static const uint32_t BLE_WINDOW_MS = 10UL * 60 * 1000;
 static const char *AP_MODE_NAMES[] = {"Always on", "Only when Wi-Fi is lost", "Off (Bluetooth backup)"};
 
+uint8_t netFails[MAX_NETS] = {0};  // failed joins per saved network since the last success
+int lastTried = -1;
+
 static void useNet(const SavedNet &n) {
   cfg.staSsid = n.ssid;
   cfg.staPass = n.pass;
@@ -976,11 +979,19 @@ static void connectBest() {
   WiFi.scanDelete();
   seenNets.assign(best.begin(), best.end());
   std::sort(seenNets.begin(), seenNets.end(), [](const std::pair<String, int> &a, const std::pair<String, int> &b) { return a.second > b.second; });
-  int pick = -1, pickR = -127;
-  for (size_t i = 0; i < nets.size(); i++)
-    if (best.count(nets[i].ssid) && best[nets[i].ssid] > pickR) { pick = i; pickR = best[nets[i].ssid]; }
-  if (pick < 0) { Serial.println("> none of the saved networks is in range"); return; }
-  Serial.printf("> strongest saved network: %s (%d dBm)\n", nets[pick].ssid.c_str(), pickR);
+  // the previous attempt did not connect: count it against that network
+  if (lastTried >= 0 && lastTried < MAX_NETS && netFails[lastTried] < 20) netFails[lastTried]++;
+  // score = signal minus 25 dB per failed try, so a network with a wrong password
+  // stops winning and the others get their turn
+  int pick = -1, pickScore = -10000;
+  for (size_t i = 0; i < nets.size() && i < (size_t)MAX_NETS; i++) {
+    if (!best.count(nets[i].ssid)) continue;
+    int score = best[nets[i].ssid] - 25 * netFails[i];
+    if (score > pickScore) { pick = i; pickScore = score; }
+  }
+  if (pick < 0) { Serial.println("> none of the saved networks is in range"); lastTried = -1; return; }
+  Serial.printf("> trying saved network %s (%d dBm, %u failed tries)\n", nets[pick].ssid.c_str(), best[nets[pick].ssid], netFails[pick]);
+  lastTried = pick;
   useNet(nets[pick]);
 }
 
@@ -1039,8 +1050,9 @@ static void wifiMgrTick() {
   bool up = WiFi.status() == WL_CONNECTED;
   if (up) {
     downSince = 0;
-    if (!upSince) upSince = now;
-    if (cfg.apMode != 0 && apOn && now - upSince > 30000 && !bleActive) hotspotOff();
+    if (!upSince) { upSince = now; memset(netFails, 0, sizeof netFails); lastTried = -1; }
+    // keep the hotspot for the first 5 minutes after every start, so you can always find the board
+    if (cfg.apMode != 0 && apOn && now - upSince > 30000 && now > 300000UL && !bleActive) hotspotOff();
     return;
   }
   upSince = 0;
@@ -1054,7 +1066,8 @@ static void wifiMgrTick() {
     }
     return;
   }
-  if (cfg.apMode == 0 || (cfg.apMode == 1 && down > 60000)) hotspotOn();
+  // safety: whatever the mode, the hotspot comes back after 2 minutes without Wi-Fi
+  if (cfg.apMode == 0 || (cfg.apMode == 1 && down > 60000) || down > 120000UL) hotspotOn();
   bool busy = cycleActive || testRunning || testRequested || otaBusy;
   if (!nets.empty() && down > 15000 && now - lastTry > 30000 && !busy) {
     lastTry = now;
