@@ -62,7 +62,7 @@
 #include "remote.h"
 #include "WiFiProv.h"
 
-#define FW_VERSION "3.9.1"
+#define FW_VERSION "3.9.2"
 #define DEFAULT_PASS "netdiag123"  // public default; change it with: pass NEWPASSWORD
 
 static const int MAX_CH = 13;    // channels 1..13 allowed in the UAE
@@ -1168,7 +1168,7 @@ input:focus,select:focus,textarea:focus,button:focus-visible{outline:none;border
 input[type=checkbox]{width:20px;height:20px;vertical-align:-4px;margin-right:6px;accent-color:var(--accent)}progress{accent-color:var(--accent);width:100%}
 button{-webkit-appearance:none;appearance:none;border:0!important;border-radius:980px!important;padding:11px 20px!important;margin:6px 6px 6px 0!important;font:inherit;font-size:16px!important;font-weight:500;background:var(--accent)!important;color:#fff!important;cursor:pointer;transition:transform .15s,opacity .15s}
 button:active{transform:scale(.97);opacity:.85}
-button[name=del],button[value=newkey],button[value=check],button.v,form[action='/reset'] button,form[action='/rollback'] button{background:var(--field)!important;color:var(--accent)!important}
+button.skip,button[name=del],button[value=newkey],button[value=check],button.v,form[action='/reset'] button,form[action='/rollback'] button{background:var(--field)!important;color:var(--accent)!important}
 button[name=del],form[action='/reset'] button{color:var(--bad)!important}
 a[style*='border-radius:22px']{display:inline-block;background:var(--accent)!important;color:#fff!important;border-radius:980px!important;padding:11px 18px!important;margin:4px 4px 4px 0;font-weight:500}
 a[style*='#1d7a3a']{background:#248a3d!important}
@@ -2509,6 +2509,29 @@ static const char *FIX_CSS =
     ".OK{color:#7dffa1}.RUN{color:#7dc8ff}.FAIL{color:#ff7d7d}.WARNs{color:#ffd27a}</style>"
     "<link rel='stylesheet' href='/style.css?v=" FW_VERSION "'>";
 
+// fixes the user chose to skip for now (hidden for 24 hours, cleared by a restart)
+std::vector<std::pair<String, uint32_t>> skippedFixes;
+static const uint32_t SKIP_MS = 24UL * 3600 * 1000;
+
+static bool isSkipped(const String &id) {
+  for (auto &k : skippedFixes)
+    if (k.first == id && millis() - k.second < SKIP_MS) return true;
+  return false;
+}
+
+static void handleFixSkip() {
+  if (!auth()) return;
+  if (server.hasArg("unskip")) skippedFixes.clear();
+  else {
+    String id = server.arg("id");
+    for (size_t i = 0; i < skippedFixes.size(); i++)
+      if (skippedFixes[i].first == id || millis() - skippedFixes[i].second >= SKIP_MS) skippedFixes.erase(skippedFixes.begin() + i--);
+    if (id.length() && skippedFixes.size() < 40) skippedFixes.push_back({id, millis()});
+  }
+  server.sendHeader("Location", "/fixes");
+  server.send(303);
+}
+
 static void handleFixesPage() {
   if (!auth()) return;
   std::vector<FixItem> list;
@@ -2520,8 +2543,12 @@ static void handleFixesPage() {
   h += "</head><body><h2>Recommended Fixes</h2>";
   if (testRunning || fixRunning) h += "<p class='c'>A test or fix is running - <a href='/fix'>see progress</a></p>";
   if (!testCount) h += "<p class='c'>Tip: run <a href='/test'>Test Internet Connection</a> first to include connection fixes.</p>";
-  if (list.empty()) h += "<p class='c'>No problems to fix right now.</p>";
+  int nSkipped = 0;
+  for (auto &f : list)
+    if (isSkipped(f.id)) nSkipped++;
+  if ((int)list.size() == nSkipped) h += "<p class='c'>No problems to fix right now.</p>";
   for (auto &f : list) {
+    if (isSkipped(f.id)) continue;
     const char *sv = f.sev == SEV_CRIT ? "CRIT" : f.sev == SEV_WARN ? "WARN" : "INFO";
     h += "<div class='c'><span class='b " + String(sv) + "'>" + (f.sev == SEV_CRIT ? "Critical" : f.sev == SEV_WARN ? "Warning" : "Info") +
          "</span><span class='b' style='background:#ffffff22'>" + (f.autoFix ? "Automatic" : "Guided") + "</span>";
@@ -2533,8 +2560,12 @@ static void handleFixesPage() {
       h += "<details><summary>Show me how</summary>" + f.how + "</details><button class='v'>I've done it - verify</button>";
     }
     if (f.id.startsWith("guide:")) h += "<details open><summary>How</summary>" + f.how + "</details>";
+    h += " <button class='skip' formaction='/fixskip'>Skip for now</button>";
     h += "</form></div>";
   }
+  if (nSkipped)
+    h += fmt("<form method='post' action='/fixskip'><p class='c'>%d fix%s skipped for now (hidden 24 h). "
+             "<button class='skip' name='unskip' value='1'>Show skipped</button></p></form>", nSkipped, nSkipped > 1 ? "es" : "");
   h += "<p style='padding:0 16px'><a href='/'>&larr; Main page</a> &nbsp; <a href='/test'>Connection test</a></p></body></html>";
   server.send(200, "text/html", h);
 }
@@ -2999,6 +3030,7 @@ static void startWeb() {
   server.on("/rollback", HTTP_POST, handleRollback);
   server.on("/api/info", HTTP_GET, handleInfo);
   server.on("/fixes", HTTP_GET, handleFixesPage);
+  server.on("/fixskip", HTTP_POST, handleFixSkip);
   server.on("/fix", HTTP_POST, handleFixRun);
   server.on("/fix", HTTP_GET, handleFixProgress);
   server.on("/router", HTTP_GET, handleRouterPage);
