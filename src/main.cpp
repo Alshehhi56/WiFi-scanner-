@@ -1313,7 +1313,10 @@ static void handleSettings() {
   parseHomeList();
   history.clear();
   saveSettings();
-  sendRedirect("Saved");
+  // apply the new list right away: re-check the last scan now, and queue a fresh scan
+  if (!cycleActive && !aps.empty()) analyse();
+  scanRequested = true;
+  sendRedirect("Saved: " + (cfg.home.length() ? cfg.home : String("(no networks)")) + " - fixes updated, new scan in about 20 s");
 }
 
 static void handleWifi() {
