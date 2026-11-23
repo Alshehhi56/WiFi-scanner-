@@ -2426,6 +2426,15 @@ static void runFixJob() {
   else if (id == "auto:roam") { fixReset("Switch to a stronger access point"); autoRoam(); }
   else if (id == "auto:napt") { fixReset("Turn on hotspot internet sharing"); autoNapt(); }
   else if (id == "auto:ota") { fixReset("Install firmware update"); autoOta(); }
+  else if (id == "auto:restart") {
+    fixReset("Restart the board");
+    fixLine(ST_OK, fmt("Memory before restart: free %lu KB, largest block %lu KB, lowest %lu KB",
+                       (unsigned long)(ESP.getFreeHeap() >> 10), (unsigned long)(ESP.getMaxAllocHeap() >> 10),
+                       (unsigned long)(ESP.getMinFreeHeap() >> 10)));
+    fixDone(ST_OK, "Restarting now - this page comes back in about 25 seconds. Settings are kept.");
+    vTaskDelay(pdMS_TO_TICKS(4000));
+    ESP.restart();
+  }
   else if (id.startsWith("test:")) { int i = id.substring(5).toInt(); fixReset(String("Verify: ") + STEP_NAME[i]); verifyByTest(i); }
   else if (id == "router:identify") { runRouterIdentify(); }
   else if (id == "router:verify") { runRouterVerify(); }
@@ -2460,6 +2469,11 @@ static void buildFixes(std::vector<FixItem> &out) {
       if (a.ssid == cfg.staSsid && a.avg() >= WiFi.RSSI() + 6 && (!WiFi.BSSID() || memcmp(a.bssid, WiFi.BSSID(), 6))) better = true;
     if (better) add("auto:roam", SEV_WARN, "Switch to a stronger access point", fmt("Board signal is %d dBm; a stronger AP with the same name is nearby.", WiFi.RSSI()), "", true);
   }
+  // memory: HTTPS (updates, speed test) needs one free block of roughly 40 KB
+  if (ESP.getMaxAllocHeap() < 45 * 1024 || ESP.getFreeHeap() < 50 * 1024)
+    add("auto:restart", SEV_WARN, "Low memory - restart the board",
+        fmt("Free %lu KB, largest block %lu KB. Updates and the speed test can fail until it restarts.",
+            (unsigned long)(ESP.getFreeHeap() >> 10), (unsigned long)(ESP.getMaxAllocHeap() >> 10)), "", true);
   if (otaLatestVer.length() && verNum(otaLatestVer) > verNum(FW_VERSION))
     add("auto:ota", SEV_INFO, "Install firmware v" + otaLatestVer, "A newer version is available.", "", true);
   if (!cfg.customPass)
@@ -2587,6 +2601,17 @@ static void handleFixesPage() {
   if (nSkipped)
     h += fmt("<form method='post' action='/fixskip'><p class='c'>%d fix%s skipped for now (hidden 24 h). "
              "<button class='skip' name='unskip' value='1'>Show skipped</button></p></form>", nSkipped, nSkipped > 1 ? "es" : "");
+  // board health: always visible, with a manual restart
+  {
+    uint32_t fr = ESP.getFreeHeap() >> 10, mx = ESP.getMaxAllocHeap() >> 10, mn = ESP.getMinFreeHeap() >> 10;
+    bool low = mx < 45 || fr < 50;
+    h += "<div class='c'><span class='b " + String(low ? "WARN" : "INFO") + "'>Board</span><div class='t'>Board health</div>";
+    h += fmt("<div class='w'>Free memory %lu KB | largest block %lu KB | lowest since start %lu KB | up %lu min<br>%s</div>",
+             (unsigned long)fr, (unsigned long)mx, (unsigned long)mn, millis() / 60000,
+             low ? "Memory is low: a restart frees it." : "Memory is fine.");
+    h += "<form method='post' action='/fix'><input type='hidden' name='id' value='auto:restart'>"
+         "<button class='v'>Restart board</button></form></div>";
+  }
   h += "<p style='padding:0 16px'><a href='/'>&larr; Main page</a> &nbsp; <a href='/test'>Connection test</a></p></body></html>";
   server.send(200, "text/html", h);
 }
