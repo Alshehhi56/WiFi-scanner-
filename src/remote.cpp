@@ -99,6 +99,8 @@ String remoteNewKey() {
   return k;
 }
 
+static void startTask();
+
 void remoteSet(bool enabled, const String &host) {
   String h = cleanHost(host);
   xSemaphoreTake(rmux, portMAX_DELAY);
@@ -109,6 +111,7 @@ void remoteSet(bool enabled, const String &host) {
   rprefs.putString("host", h);
   if (rOn && rKey.length() < 32) remoteNewKey();
   rReconfig = true;
+  if (rOn) startTask();
 }
 
 // ------------------------------------------------------------ TLS helpers
@@ -411,15 +414,24 @@ static void remoteTask(void *) {
       continue;
     }
     setState("Connecting to " + cHost + "...");
-    if (wsConnect()) {
+    // buffers exist only while a connection is open, so remote access costs no memory when unused
+    if (!txBuf) txBuf = (uint8_t *)malloc(1024);
+    if (!rxBuf) rxBuf = (uint8_t *)malloc(MAX_IN_FRAME + 1);
+    bool mem = txBuf && rxBuf;
+    if (!mem) lastErr = "not enough free memory";
+    if (mem && wsConnect()) {
       backoff = 3000;
       setState("Connected - reachable at https://" + cHost);
       wsSession();
       // a polite close frame; ignore failures
       if (tls) wsSend(0x8, (const uint8_t *)"\x03\xe8", 2);
       tlsClose();
+      free(rxBuf); rxBuf = nullptr;
+      free(txBuf); txBuf = nullptr;
       if (rReconfig || !rOn) continue;
     }
+    free(rxBuf); rxBuf = nullptr;
+    free(txBuf); txBuf = nullptr;
     setState("Offline: " + lastErr + " - retrying in " + String(backoff / 1000) + " s");
     uint32_t until = millis() + backoff;
     while (millis() < until && !rReconfig) vTaskDelay(pdMS_TO_TICKS(250));
@@ -434,8 +446,12 @@ void remoteBegin(const char *fwVersion) {
   rOn = rprefs.getBool("on", false);
   rHost = rprefs.getString("host", "");
   rKey = rprefs.getString("key", "");
-  txBuf = (uint8_t *)malloc(1024);
-  rxBuf = (uint8_t *)malloc(MAX_IN_FRAME + 1);
-  if (!txBuf || !rxBuf) { Serial.println("! remote: not enough memory, remote access disabled"); return; }
+  if (rOn) startTask();  // the task (and its 10 KB stack) only exists once remote access is turned on
+}
+
+static void startTask() {
+  static bool started = false;
+  if (started || !rmux) return;
+  started = true;
   xTaskCreatePinnedToCore(remoteTask, "remote", 10240, nullptr, 1, nullptr, 0);
 }

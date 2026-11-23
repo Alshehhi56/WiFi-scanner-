@@ -2117,8 +2117,8 @@ static void handleUpdatePage() {
   h += fmt("<tr><td>Flash</td><td>%lu MB</td></tr>", (unsigned long)(ESP.getFlashChipSize() >> 20));
   h += fmt("<tr><td>PSRAM</td><td>%lu KB %s</td></tr>", (unsigned long)(ESP.getPsramSize() >> 10),
            ESP.getPsramSize() ? "" : "(not enabled in build)");
-  h += fmt("<tr><td>Free heap</td><td>%lu KB (min %lu KB)</td></tr>", (unsigned long)(ESP.getFreeHeap() >> 10),
-           (unsigned long)(ESP.getMinFreeHeap() >> 10));
+  h += fmt("<tr><td>Free heap</td><td>%lu KB (min %lu KB, largest block %lu KB)</td></tr>", (unsigned long)(ESP.getFreeHeap() >> 10),
+           (unsigned long)(ESP.getMinFreeHeap() >> 10), (unsigned long)(ESP.getMaxAllocHeap() >> 10));
   h += fmt("<tr><td>App size</td><td>%lu KB of %lu KB slot</td></tr>", (unsigned long)(ESP.getSketchSize() >> 10),
            (unsigned long)((ESP.getSketchSize() + ESP.getFreeSketchSpace()) >> 10));
   h += String("<tr><td>Running slot</td><td>") + (run ? run->label : "?") + "</td></tr>";
