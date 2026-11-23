@@ -62,7 +62,7 @@
 #include "remote.h"
 #include "WiFiProv.h"
 
-#define FW_VERSION "3.9.2"
+#define FW_VERSION "3.9.3"
 #define DEFAULT_PASS "netdiag123"  // public default; change it with: pass NEWPASSWORD
 
 static const int MAX_CH = 13;    // channels 1..13 allowed in the UAE
