@@ -629,14 +629,24 @@ static void analyse() {
          "Channel and security advice is general until you choose your SSIDs",
          "Type:  home YourSSID   (several: home SSID1,SSID2)");
   } else {
+    // the board's radio is 2.4 GHz only: a network never seen since boot is most likely 5 GHz,
+    // so it is noted once (info) instead of being reported as missing on every cycle
+    static std::vector<String> everSeen;
     for (auto &h : homeList) {
       int count = 0;
       for (auto &a : aps)
         if (a.ssid == h) count++;
-      if (!count)
-        addF("missing:" + h, SEV_WARN, CONF_CONFIRMED, "Your networks", h + " was not detected",
-             fmt("not seen in %d scans", roundsDone),
-             "Check the exact SSID spelling, that it broadcasts on 2.4 GHz, and that it is in range");
+      bool seenBefore = std::find(everSeen.begin(), everSeen.end(), h) != everSeen.end();
+      if (count && !seenBefore && everSeen.size() < 20) everSeen.push_back(h);
+      if (count) continue;
+      if (seenBefore)
+        addF("missing:" + h, SEV_WARN, CONF_CONFIRMED, "Your networks", h + " has disappeared",
+             fmt("seen earlier, not seen in the last %d scans", roundsDone),
+             "Check that the router or extender for this network is powered on and in range");
+      else
+        addF("only5g:" + h, SEV_INFO, CONF_LIKELY, "Your networks", h + " cannot be checked",
+             "never seen on 2.4 GHz - if it is a 5 GHz network, this board cannot see it",
+             "Nothing to do for a 5 GHz network. Otherwise check the spelling of the name");
     }
     for (size_t r = 0; r < radios.size(); r++)
       if (radios[r].home) analyseHomeRadio(r);
@@ -1342,8 +1352,16 @@ static void handleWifi() {
   if (!pw.length())  // keep the saved password when re-adding a known network without one
     for (auto &n : nets)
       if (n.ssid == ss) { pw = n.pass; break; }
+  bool visible = seenNets.empty();
+  for (auto &sn : seenNets)
+    if (sn.first == ss) visible = true;
   rememberNet(ss, pw);
   saveSettings();
+  if (!visible) {  // probably 5 GHz: saved, but the board will only use it if it ever appears on 2.4 GHz
+    sendRedirect("Saved, but " + ss + " is not visible on 2.4 GHz (5 GHz networks cannot be used by this board). "
+                 "Staying on the current network.");
+    return;
+  }
   sendRedirect("Saved. Connecting to " + ss + " - refresh in 15 s");
   delay(200);
   useNet(nets[0]);
